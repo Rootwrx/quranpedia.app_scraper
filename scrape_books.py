@@ -36,6 +36,7 @@ import argparse
 import json
 import re
 import sys
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
 from pathlib import Path
@@ -82,10 +83,80 @@ def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
 
 
+MAX_NAME_LENGTH = 100
+
+
 def safe_name(value: str) -> str:
     value = re.sub(r'[\\/:*?"<>|]+', "", clean_text(value))
     value = re.sub(r"\.+$", "", value).strip()
     return value or "misc"
+
+
+def truncated_name(value: str, limit: int = MAX_NAME_LENGTH) -> str:
+    value = safe_name(value)
+    if len(value) <= limit:
+        return value
+    return value[:limit].rstrip() + "…"
+
+
+def build_display_names(catalog: Dict[str, Any]) -> Dict[str, str]:
+    """Stable Arabic folder/file names; duplicate titles get the author."""
+    books = catalog.get("books", {})
+    base: Dict[str, str] = {}
+    by_title: Dict[str, List[str]] = defaultdict(list)
+
+    for book_id, entry in sorted(books.items()):
+        title = clean_text(entry.get("title")) or f"كتاب {book_id}"
+        base[book_id] = title
+        by_title[title].append(book_id)
+
+    for title, book_ids in by_title.items():
+        if len(book_ids) < 2:
+            continue
+        for book_id in book_ids:
+            author = clean_text(books[book_id].get("author"))
+            if author:
+                base[book_id] = f"{title} — {author}"
+
+    grouped: Dict[str, List[str]] = defaultdict(list)
+    for book_id, label in base.items():
+        grouped[truncated_name(label)].append(book_id)
+
+    result: Dict[str, str] = {}
+    for label, book_ids in grouped.items():
+        for index, book_id in enumerate(sorted(book_ids), start=1):
+            result[book_id] = label if index == 1 else f"{label} ({index})"
+    return result
+
+
+def display_name_for(book_id: str, catalog: Optional[Dict[str, Any]] = None,
+                     meta: Optional[Dict[str, Any]] = None,
+                     entry: Optional[Dict[str, Any]] = None) -> str:
+    if isinstance(meta, dict) and meta.get("display_name"):
+        return truncated_name(str(meta["display_name"]))
+
+    catalog_entry = catalog.get("books", {}).get(book_id, {}) if catalog else {}
+    title = clean_text(meta.get("title")) if isinstance(meta, dict) else ""
+    catalog_title = clean_text(catalog_entry.get("title"))
+    if title and not catalog_title:
+        return truncated_name(title)
+
+    if catalog_entry.get("display_name"):
+        return truncated_name(catalog_entry["display_name"])
+    if entry and entry.get("display_name"):
+        return truncated_name(entry["display_name"])
+    if not title and entry:
+        title = clean_text(entry.get("title"))
+    return truncated_name(title or catalog_title or f"كتاب {book_id}")
+
+
+def find_meta_path(json_dir: Path, book_id: str) -> Optional[Path]:
+    """Find a book's meta.json under either the new Arabic or legacy bNNN layout."""
+    for path in sorted(json_dir.glob("*/*/meta.json")):
+        data = json_read(path)
+        if isinstance(data, dict) and str(data.get("id")) == book_id:
+            return path
+    return None
 
 
 def json_write(path: Path, data: Any) -> None:
@@ -371,18 +442,23 @@ def parse_category_index(html: str) -> List[Dict[str, Any]]:
         name = clean_text(link.get_text(" ", strip=True))
         small = h3.select_one("small")
         declared = parse_int(small.get_text(strip=True)) if small else None
-        direct_books = []
+        direct_books: List[Dict[str, str]] = []
+        seen_ids: set[str] = set()
         for a in group.select('a[href^="b"][href$="/index.html"]'):
             absolute = urljoin(BOOKS_INDEX, str(a.get("href")))
             bid = book_id_from_url(absolute)
-            if bid and bid not in direct_books:
-                direct_books.append(bid)
+            if bid and bid not in seen_ids:
+                seen_ids.add(bid)
+                direct_books.append({
+                    "id": bid,
+                    "title": clean_text(a.get_text(" ", strip=True)),
+                })
         categories.append({
             "slug": slug,
             "name": name,
             "declared_count": declared,
             "url": urljoin(BOOKS_INDEX, href),
-            "index_book_ids": direct_books,
+            "index_books": direct_books,
         })
     return categories
 
@@ -465,12 +541,19 @@ def build_catalog(workers: int = 8, retries: int = 3, timeout: int = 30,
                 entry["author"] = card["author"]
 
     for cat in categories:
-        for bid in cat["index_book_ids"]:
+        for item in cat["index_books"]:
+            bid = item["id"]
             entry = book_map.setdefault(bid, {
                 "id": bid, "title": "", "author": "", "categories": [], "cards": [],
             })
+            if not entry["title"]:
+                entry["title"] = item.get("title", "")
             if cat["slug"] not in entry["categories"]:
                 entry["categories"].append(cat["slug"])
+
+    display_names = build_display_names({"books": book_map})
+    for book_id, display_name in display_names.items():
+        book_map[book_id]["display_name"] = display_name
 
     category_summaries = []
     for cat in categories:
@@ -490,6 +573,7 @@ def build_catalog(workers: int = 8, retries: int = 3, timeout: int = 30,
         "total_books": len(book_map),
         "total_categories": len(categories),
         "categories": category_summaries,
+        "display_names": display_names,
         "books": dict(sorted(book_map.items())),
     }
 
@@ -881,8 +965,8 @@ def part_urls_from_sitemap(xml: str, book_id: str) -> Dict[int, str]:
 # JSON scraping
 # ---------------------------------------------------------------------------
 
-def paths_for_book(json_dir: Path, category_dir: str, book_id: str) -> Tuple[Path, Path, Path]:
-    book_dir = json_dir / category_dir / book_id
+def paths_for_book(json_dir: Path, category_dir: str, book_name: str) -> Tuple[Path, Path, Path]:
+    book_dir = json_dir / category_dir / book_name
     return book_dir / "meta.json", book_dir / "parts", book_dir / "full.json"
 
 
@@ -899,10 +983,10 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
         "name": category_name,
     }
     category_dir = category_dir_name(category, args.category_style)
-    meta_path, parts_dir, full_path = paths_for_book(args.json_dir, category_dir, book_id)
     landing_url = entry.get("cards", [{}])[0].get("url") or f"{BASE}/books/{book_id}/index.html"
 
-    meta = json_read(meta_path)
+    existing_path = find_meta_path(args.json_dir, book_id)
+    meta = json_read(existing_path) if existing_path else None
     if args.force or meta is None:
         try:
             landing_html = sq.fetch_text(
@@ -916,6 +1000,26 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
     else:
         # Catalog membership/card data can change; keep the stored rich record.
         meta["catalog_entry"] = entry
+
+    book_name = display_name_for(book_id, catalog, meta, entry)
+    meta["display_name"] = book_name
+    meta_path, parts_dir, full_path = paths_for_book(args.json_dir, category_dir, book_name)
+
+    # Move legacy bNNN output folders to the new Arabic-name layout once.
+    if existing_path and existing_path != meta_path and existing_path.exists():
+        old_dir = existing_path.parent
+        new_dir = meta_path.parent
+        if not new_dir.exists():
+            try:
+                new_dir.parent.mkdir(parents=True, exist_ok=True)
+                old_dir.rename(new_dir)
+                print(f"[move] {book_id}: {old_dir} -> {new_dir}")
+            except OSError as exc:
+                print(f"[warn] {book_id}: cannot move {old_dir} to {new_dir}: {exc}",
+                      file=sys.stderr)
+                meta_path = existing_path
+                parts_dir = existing_path.parent / "parts"
+                full_path = existing_path.parent / "full.json"
 
     try:
         sitemap_xml = sq.fetch_text(
@@ -1323,11 +1427,18 @@ def build_book_docx(meta: Dict[str, Any], parts: Sequence[Dict[str, Any]],
 def local_book_records(json_dir: Path, docx_dir: Path,
                        args: argparse.Namespace) -> Tuple[List[str], Dict[str, Path]]:
     records: Dict[str, Path] = {}
-    for meta_path in sorted(json_dir.glob("*/b*/meta.json")):
+    for meta_path in sorted(json_dir.glob("*/*/meta.json")):
         data = json_read(meta_path)
         if not isinstance(data, dict) or not data.get("id"):
             continue
-        records[str(data["id"])] = meta_path
+        book_id = str(data["id"])
+        previous = records.get(book_id)
+        if previous is None:
+            records[book_id] = meta_path
+            continue
+        # Prefer the new Arabic-name folder over a leftover legacy bNNN folder.
+        if data.get("display_name") and meta_path.parent.name == data["display_name"]:
+            records[book_id] = meta_path
 
     if args.all:
         selected = sorted(records)
@@ -1363,6 +1474,7 @@ def build_docx_books(args: argparse.Namespace) -> int:
 
     quran_color = sq.hex_to_rgb(args.quran_color)
     t1_color = sq.hex_to_rgb(args.t1_color)
+    catalog = json_read(args.catalog_file)
     errors = 0
 
     for book_id in selected:
@@ -1397,13 +1509,14 @@ def build_docx_books(args: argparse.Namespace) -> int:
             continue
 
         category_dir = meta.get("category_dir") or meta_path.parent.parent.name
-        out_dir = args.docx_dir / category_dir / book_id
+        book_name = display_name_for(book_id, catalog, meta)
+        out_dir = args.docx_dir / category_dir / book_name
         groups: List[Tuple[Sequence[Dict[str, Any]], Path, bool]] = []
         if args.full:
-            groups.append((parts, out_dir / f"{book_id}-full.docx", True))
+            groups.append((parts, out_dir / f"{book_name}-full.docx", True))
         for part in parts:
             stem = part.get("part_stem") or part_stem(int(part["part"]), total)
-            groups.append(([part], out_dir / f"{stem}.docx", False))
+            groups.append(([part], out_dir / f"{book_name}-{stem}.docx", False))
 
         for group, output, full_book in groups:
             ok = build_book_docx(

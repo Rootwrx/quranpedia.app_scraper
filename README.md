@@ -71,15 +71,18 @@ Output is category-first:
 
 ```
 data/books/catalog.json
-data/books/json/<category>/<bNNN>/meta.json
-data/books/json/<category>/<bNNN>/parts/s001.json
-data/books/json/<category>/<bNNN>/full.json        # --full only
-data/books/docx/<category>/<bNNN>/s001.docx
-data/books/docx/<category>/<bNNN>/<bNNN>-full.docx # --full only
+data/books/json/<category>/<Arabic book name>/meta.json
+data/books/json/<category>/<Arabic book name>/parts/s001.json
+data/books/json/<category>/<Arabic book name>/full.json
+data/books/docx/<category>/<Arabic book name>/<Arabic book name>-s001.docx
+data/books/docx/<category>/<Arabic book name>/<Arabic book name>-full.docx
 ```
 
 Category folders use the Arabic category name by default; `--category-style slug`
-uses the URL slug instead. Every DOCX begins with a full book record (cover plus
+uses the URL slug instead. Book folders and DOCX filenames use the Arabic book
+title, not `bNNN`. Duplicate titles are disambiguated with the author name, and
+exact duplicates get a numeric suffix. Legacy `bNNN` folders are moved
+automatically on the next scrape. Every DOCX begins with a full book record (cover plus
 بطاقة الكتاب, author, description, sources, TOC and related books) before the
 part text. Styling reuses the existing Word-first RTL pipeline: `#F3EEE2` page
 color, `Kitab` for Quran text, `KFGQPC Uthman Taha Naskh` for body text, 16 pt
