@@ -67,9 +67,10 @@ table of contents, and related books. Each sitemap
 CLI keeps `--parts` as a compatibility name, but the DOCX does **not** invent
 `الجزء N` or `الباب N` headings. The page's own printed title/location is kept
 inside the body text. The JSON key `parts/` is kept for compatibility. Chapter
-pages preserve printed locations (`data-loc`), headings, Quran quotes, folio
-markers, footnotes and plain text/styled segments. No raw HTML is stored unless
-`--include-html` is used.
+pages preserve printed locations (`data-loc`) in JSON, plus headings, Quran
+quotes, folio markers, footnotes and plain text/styled segments. The DOCX does
+not print the `ص N` location labels; only the book content and footnotes are
+rendered. No raw HTML is stored unless `--include-html` is used.
 
 Output is category-first:
 

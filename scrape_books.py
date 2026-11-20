@@ -1348,27 +1348,18 @@ def add_book_metadata(doc, meta: Dict[str, Any], *, font: str, size: float,
     doc.add_page_break()
 
 
-def without_juz_prefix(text: str) -> str:
-    """Drop the site's printed 'الجزء N ·' prefix from generated DOCX labels."""
-    return re.sub(r"الجزء\s+\d+\s*·\s*", "", clean_text(text)).strip()
-
-
 def render_part(doc, part: Dict[str, Any], *, font: str, size: float,
                 line_spacing: float, quran_font: str,
                 quran_color: Tuple[int, int, int],
                 t1_color: Tuple[int, int, int], bold: bool,
                 include_source: bool) -> None:
-    """Render one sN.html page without inventing a bab heading.
+    """Render one sN.html page without invented bab or `ص N` location labels.
 
-    The site already prints its own title/location inside the content; adding
-    `الباب N — ...` duplicates it and mixes in the printed juz label.
+    Printed locations remain in JSON as `data_loc`, but DOCX stays clean: only
+    the page's real content and footnotes are rendered.
     """
     pages = part.get("pages", [])
     for page in pages:
-        if len(pages) > 1 and page.get("data_loc"):
-            loc = without_juz_prefix(page["data_loc"])
-            sq.add_paragraph(doc, loc, size=size - 2, color=GRAY,
-                             font_name=font, line_spacing=line_spacing, space_after=2)
         add_blocks(doc, page.get("blocks", []), font=font, size=size,
                    line_spacing=line_spacing, quran_font=quran_font,
                    quran_color=quran_color, t1_color=t1_color, bold=bold)
