@@ -9,10 +9,10 @@ The books section is separate from the ayah-based tafsir/uloom pipeline:
 
 Modes
 -----
-  default          scrape selected books into JSON only
-  --docx           build DOCX only from local JSON (no network calls)
-  --full           scrape/build every bab and additionally write full JSON/DOCX
-  --parts SPEC     limit abwab, e.g. 1,2,5-8 or all (default: 1)
+  default          scrape the complete book into full JSON
+  --docx           build one full DOCX from local JSON (no network calls)
+  --parts SPEC     limit abwab for a focused test, e.g. 1 or 1-3
+  --full           backwards-compatible alias for the default full mode
 
 Selection
 ---------
@@ -22,12 +22,12 @@ Selection
 
 Examples
 --------
-  python scrape_books.py --books b373,b11728 --parts 1
-  python scrape_books.py --books b373 --full
-  python scrape_books.py --books b373 --full --docx
-  python scrape_books.py --category iraab --parts 1 --workers 4
-  python scrape_books.py --all --parts 1 --workers 8
-  python scrape_books.py --all --full --docx
+  python scrape_books.py --books b373
+  python scrape_books.py --books b373 --docx
+  python scrape_books.py --books b11728 --parts 1
+  python scrape_books.py --category iraab --workers 4
+  python scrape_books.py --all --workers 8
+  python scrape_books.py --all --docx
 """
 
 from __future__ import annotations
@@ -232,6 +232,13 @@ def parse_part_spec(spec: str, total: int) -> List[int]:
             if 1 <= n <= total:
                 result.add(n)
     return sorted(result)
+
+
+def is_full_scope(args: argparse.Namespace) -> bool:
+    """Full is the default; --parts limits it, --full remains an alias."""
+    parts = getattr(args, "parts", None)
+    full = getattr(args, "full", False)
+    return bool(full or not parts or str(parts).strip().lower() in ("all", "*"))
 
 
 def part_width(total: int) -> int:
@@ -1041,12 +1048,13 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
     json_write(meta_path, meta)
     parts_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.full or (args.parts or "").strip().lower() in ("all", "*"):
+    full_scope = is_full_scope(args)
+    if full_scope:
         selected = list(urls)
     else:
-        selected = parse_part_spec(args.parts, len(urls))
+        selected = parse_part_spec(args.parts or "", len(urls))
         if not selected:
-            print(f"[error] {book_id}: no valid parts selected from {args.parts!r}", file=sys.stderr)
+            print(f"[error] {book_id}: no valid abwab selected from {args.parts!r}", file=sys.stderr)
             return 1
 
     errors = 0
@@ -1088,7 +1096,7 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
             print(f"[ok]   {book_id} part {number}: {part['page_count']} pages, "
                   f"{part['footnote_count']} notes -> {out}")
 
-    if args.full and not args.no_full_json and errors == 0:
+    if full_scope and not args.no_full_json and errors == 0:
         full = dict(meta)
         full["full"] = True
         full["included_parts"] = selected
@@ -1367,12 +1375,11 @@ def render_part(doc, part: Dict[str, Any], *, font: str, size: float,
                 quran_color: Tuple[int, int, int],
                 t1_color: Tuple[int, int, int], bold: bool,
                 include_source: bool) -> None:
-    title = without_juz_prefix(part.get("title") or "")
-    heading = f"الباب {part.get('part', '')}"
-    if title:
-        heading += f" — {title}"
-    add_section_heading(doc, heading, font, size, line_spacing, level=0)
+    """Render one sN.html page without inventing a bab heading.
 
+    The site already prints its own title/location inside the content; adding
+    `الباب N — ...` duplicates it and mixes in the printed juz label.
+    """
     pages = part.get("pages", [])
     for page in pages:
         if len(pages) > 1 and page.get("data_loc"):
@@ -1469,6 +1476,22 @@ def local_book_records(json_dir: Path, docx_dir: Path,
     return selected, records
 
 
+def remove_per_bab_docx(out_dir: Path, book_name: str, keep: Path) -> None:
+    """Remove old per-bab DOCX files left by earlier script versions."""
+    patterns = (
+        re.compile(rf"{re.escape(book_name)}-s\d+\.docx"),
+        re.compile(r"s\d+\.docx"),
+    )
+    for path in sorted(out_dir.glob("*.docx")):
+        if path == keep or not any(pattern.fullmatch(path.name) for pattern in patterns):
+            continue
+        try:
+            path.unlink()
+            print(f"[cleanup] removed per-bab DOCX {path}")
+        except OSError as exc:
+            print(f"[warn] cannot remove old per-bab DOCX {path}: {exc}", file=sys.stderr)
+
+
 def build_docx_books(args: argparse.Namespace) -> int:
     selected, records = local_book_records(args.json_dir, args.docx_dir, args)
     if not selected:
@@ -1492,12 +1515,13 @@ def build_docx_books(args: argparse.Namespace) -> int:
             continue
         parts_dir = meta_path.parent / "parts"
         part_numbers = meta.get("part_numbers") or list(range(1, int(meta.get("part_count") or 0) + 1))
-        if args.full or (args.parts or "").strip().lower() in ("all", "*"):
+        full_scope = is_full_scope(args)
+        if full_scope:
             wanted = list(part_numbers)
         else:
-            wanted = parse_part_spec(args.parts, len(part_numbers))
+            wanted = parse_part_spec(args.parts or "", len(part_numbers))
         if not wanted:
-            print(f"[error] {book_id}: no valid parts selected", file=sys.stderr)
+            print(f"[error] {book_id}: no valid abwab selected", file=sys.stderr)
             errors += 1
             continue
 
@@ -1517,24 +1541,20 @@ def build_docx_books(args: argparse.Namespace) -> int:
         category_dir = meta.get("category_dir") or meta_path.parent.parent.name
         book_name = display_name_for(book_id, catalog, meta)
         out_dir = args.docx_dir / category_dir / book_name
-        groups: List[Tuple[Sequence[Dict[str, Any]], Path, bool]] = []
-        if args.full:
-            groups.append((parts, out_dir / f"{book_name}-full.docx", True))
-        for part in parts:
-            stem = part.get("part_stem") or part_stem(int(part["part"]), total)
-            groups.append(([part], out_dir / f"{book_name}-{stem}.docx", False))
-
-        for group, output, full_book in groups:
-            ok = build_book_docx(
-                meta, group, output, full_book=full_book,
-                font=args.book_font, size=args.font_size,
-                line_spacing=args.line_spacing, quran_font=args.quran_font,
-                quran_color=quran_color, t1_color=t1_color,
-                page_color=args.page_color, bold=args.bold_text,
-                include_source=args.include_source,
-            )
-            if not ok:
-                errors += 1
+        suffix = "-full" if full_scope else "-selected"
+        output = out_dir / f"{book_name}{suffix}.docx"
+        ok = build_book_docx(
+            meta, parts, output, full_book=full_scope,
+            font=args.book_font, size=args.font_size,
+            line_spacing=args.line_spacing, quran_font=args.quran_font,
+            quran_color=quran_color, t1_color=t1_color,
+            page_color=args.page_color, bold=args.bold_text,
+            include_source=args.include_source,
+        )
+        if not ok:
+            errors += 1
+        elif full_scope:
+            remove_per_bab_docx(out_dir, book_name, output)
     return errors
 
 
@@ -1552,10 +1572,10 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     select.add_argument("--category", dest="categories", action="append", default=[],
                         help="select one category by slug or Arabic name (repeatable)")
 
-    p.add_argument("--parts", default="1",
-                   help="abwab (sN.html) to process: 1, 1-3, 1,4,7-9, or all (default: 1)")
+    p.add_argument("--parts", default=None,
+                   help="limit abwab to e.g. 1 or 1-3 (default: every bab / full book)")
     p.add_argument("--full", action="store_true",
-                   help="process every bab and write full JSON/DOCX in addition to per-bab files")
+                   help="backwards-compatible alias for the default full-book mode")
     p.add_argument("--docx", action="store_true", dest="build_only",
                    help="build DOCX only from local JSON; no network calls")
     p.add_argument("--workers", type=int, default=6, help="concurrent requests (default: 6)")
@@ -1567,7 +1587,7 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
     p.add_argument("--include-html", action="store_true",
                    help="also store raw part HTML in JSON")
     p.add_argument("--no-full-json", action="store_true",
-                   help="do not write <book>-full.json in --full scrape mode")
+                   help="skip full.json (not recommended; full JSON is the default)")
     p.add_argument("--category-style", choices=("name", "slug"), default="name",
                    help="category folder names: Arabic name (default) or URL slug")
 
@@ -1599,9 +1619,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 2
 
     if args.build_only:
-        mode = "DOCX"
-        print(f"Books: local | mode={mode} | scope="
-              f"{'FULL' if args.full else f'parts {args.parts}'}")
+        scope = "FULL" if is_full_scope(args) else f"parts {args.parts}"
+        print(f"Books: local | mode=DOCX | scope={scope}")
         return 1 if build_docx_books(args) else 0
 
     try:
@@ -1635,8 +1654,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         return 1
 
     label = "ALL" if args.all else ("CATEGORY" if args.categories else "SHORTLIST")
-    print(f"Books: {len(selected)} | mode=SCRAPE | scope="
-          f"{'FULL' if args.full else f'parts {args.parts}'} | selection={label}")
+    scope = "FULL" if is_full_scope(args) else f"parts {args.parts}"
+    print(f"Books: {len(selected)} | mode=SCRAPE | scope={scope} | selection={label}")
     errors = 0
     for book_id in selected:
         errors += scrape_book(book_id, catalog, args)

@@ -63,22 +63,29 @@ other works), editor, publisher, edition, printed page count, language,
 description, about, content, importance, edition details, source evidence, full
 table of contents, and related books. Each sitemap
 (`https://quranpedia.app/sitemap-books-bNNN.xml`) supplies the chapter pages
-(`s1.html`, `s2.html`, …). The site calls these **أبواب** (singular: باب), so DOCX
-headings use `الباب N`, not `الجزء N`. The JSON key `parts/` is kept for
-compatibility. Chapter pages preserve printed locations (`data-loc`),
-headings, Quran quotes, folio markers, footnotes and plain text/styled segments.
-No raw HTML is stored unless `--include-html` is used.
+(`s1.html`, `s2.html`, …). The site calls these **أبواب** (singular: باب); the
+CLI keeps `--parts` as a compatibility name, but the DOCX does **not** invent
+`الجزء N` or `الباب N` headings. The page's own printed title/location is kept
+inside the body text. The JSON key `parts/` is kept for compatibility. Chapter
+pages preserve printed locations (`data-loc`), headings, Quran quotes, folio
+markers, footnotes and plain text/styled segments. No raw HTML is stored unless
+`--include-html` is used.
 
 Output is category-first:
 
 ```
 data/books/catalog.json
 data/books/json/<category>/<Arabic book name>/meta.json
-data/books/json/<category>/<Arabic book name>/parts/s001.json
+data/books/json/<category>/<Arabic book name>/parts/s001.json   # source files
 data/books/json/<category>/<Arabic book name>/full.json
-data/books/docx/<category>/<Arabic book name>/<Arabic book name>-s001.docx
 data/books/docx/<category>/<Arabic book name>/<Arabic book name>-full.docx
 ```
+
+The complete book is the default: no `--full` or `--parts` is needed. Per-bab
+DOCX files are no longer written; `--docx` produces one complete DOCX per book
+and removes old generated `<book>-sNNN.docx` files. `--parts 1` is only for a
+focused scrape/test and writes a single
+`<Arabic book name>-selected.docx` when combined with `--docx`.
 
 Category folders use the Arabic category name by default; `--category-style slug`
 uses the URL slug instead. Book folders and DOCX filenames use the Arabic book
@@ -93,23 +100,25 @@ non-bold/non-italic, red dynamic `PAGE` footer, and collapsible outline headings
 Selection is explicit:
 
 ```bash
-# shortlist: scrape bab 1 only
-python scrape_books.py --books b373,b11728 --parts 1
+# complete book (default): full.json, then one complete DOCX
+python scrape_books.py --books b373
+python scrape_books.py --books b373 --docx
 
-# shortlist: every bab plus full.json and per-bab/full DOCX
-python scrape_books.py --books b373 --full
-python scrape_books.py --books b373 --full --docx
+# focused test: bab 1 only, plus one -selected.docx if needed
+python scrape_books.py --books b11728 --parts 1
+python scrape_books.py --books b11728 --parts 1 --docx
 
 # one category by Arabic name or URL slug
-python scrape_books.py --category "إعراب القرآن" --parts 1
-python scrape_books.py --category iraab --parts 1 --docx
+python scrape_books.py --category "إعراب القرآن"
+python scrape_books.py --category iraab --docx
 
-# all 597 books (no scraping happens until you run one of these)
-python scrape_books.py --all --parts 1 --workers 8
-python scrape_books.py --all --full --docx
+# all 597 books
+python scrape_books.py --all --workers 8
+python scrape_books.py --all --docx
 ```
 
-`--docx` is local-only and never touches the network. Missing JSON or a locked
+`--full` is still accepted as an alias for the default. `--docx` is local-only
+and never touches the network. Missing JSON or a locked
 DOCX output is reported with `[error]` and exits `1`, matching the main scraper.
 Verified samples include `b373` (1 bab, 5 printed pages), `b11728` (107 abwab,
 83-entry TOC), and `b38075` (footnotes preserved in JSON and DOCX).
