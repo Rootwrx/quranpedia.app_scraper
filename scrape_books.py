@@ -1333,25 +1333,8 @@ def add_book_metadata(doc, meta: Dict[str, Any], *, font: str, size: float,
                 sq.add_paragraph(doc, text, size=size - 1, font_name=font,
                                  line_spacing=line_spacing)
 
-    toc = meta.get("toc") or {}
-    if toc.get("present"):
-        add_section_heading(doc, toc.get("heading") or "فهرس الكتاب",
-                            font, size, line_spacing)
-        if toc.get("note"):
-            sq.add_paragraph(doc, toc["note"], size=size - 1, color=GRAY,
-                             font_name=font, line_spacing=line_spacing)
-        for volume in toc.get("volumes", []):
-            sq.add_paragraph(doc, volume.get("label", ""), size=size, bold=True,
-                             font_name=font, line_spacing=line_spacing, space_after=2)
-            for item in volume.get("items", []):
-                text = item.get("title", "")
-                if item.get("page"):
-                    text += f"  [ص {item['page']}]"
-                if item.get("part"):
-                    text += f"  (s{item['part']})"
-                sq.add_paragraph(doc, text, size=size - 2, font_name=font,
-                                 line_spacing=line_spacing)
-
+    # The site TOC can contain hundreds of entries; it stays in JSON only.
+    # Rendering it here made the DOCX enormous and pushed the real text far down.
     related = meta.get("related_books") or []
     if related:
         add_section_heading(doc, "كتب ذات صلة", font, size, line_spacing)
@@ -1417,6 +1400,10 @@ def build_book_docx(meta: Dict[str, Any], parts: Sequence[Dict[str, Any]],
     add_book_metadata(doc, meta, font=font, size=size, line_spacing=line_spacing,
                       quran_font=quran_font, quran_color=quran_color,
                       t1_color=t1_color)
+    # Close the metadata outline section before the actual book text. Without
+    # this, the last metadata heading ("كتب ذات صلة") becomes the Word outline
+    # parent for every following page of the book.
+    add_section_heading(doc, "متن الكتاب", font, size, line_spacing, level=0)
 
     for index, part in enumerate(parts):
         if index:

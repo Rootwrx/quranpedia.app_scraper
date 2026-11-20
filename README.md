@@ -92,8 +92,11 @@ uses the URL slug instead. Book folders and DOCX filenames use the Arabic book
 title, not `bNNN`. Duplicate titles are disambiguated with the author name, and
 exact duplicates get a numeric suffix. Legacy `bNNN` folders are moved
 automatically on the next scrape. Every DOCX begins with a full book record (cover plus
-بطاقة الكتاب, author, description, sources, TOC and related books) before the
-chapter text. Styling reuses the existing Word-first RTL pipeline: `#F3EEE2` page
+بطاقة الكتاب, author, description, sources and related books) before the chapter
+text. The full TOC stays in JSON only; it is not rendered in DOCX because some
+books have hundreds of entries. A `متن الكتاب` outline heading starts the actual
+book text, so `كتب ذات صلة` wraps only its own list. Styling reuses the existing
+Word-first RTL pipeline: `#F3EEE2` page
 color, `Kitab` for Quran text, `KFGQPC Uthman Taha Naskh` for body text, 16 pt
 non-bold/non-italic, red dynamic `PAGE` footer, and collapsible outline headings.
 
