@@ -1,0 +1,195 @@
+# QuranPedia tafsir scraper
+
+Investigation + working scraper for <https://quranpedia.app/tafseer/index.html>.
+
+## What the investigation found
+
+- The site is **fully static**. Every tafsir has its own sitemap:
+  `https://quranpedia.app/sitemap-<slug>.xml` (e.g. `sitemap-tabary.xml`).
+- Each sitemap lists exactly one URL per ayah that the tafsir covers:
+  `https://quranpedia.app/tafseer/<slug>/sura<s>-aya<a>.html`.
+  - 71 tafsirs, **317,989 ayah pages** total.
+  - 38 tafsirs cover all 6,236 ayahs; the rest are partial (e.g. `turath-hadir` has 24 pages).
+- `robots.txt` allows crawling (`User-agent: * / Allow: /`).
+- Surah metadata (names, ayah counts, starting page) is embedded in
+  `https://quranpedia.app/assets/quran-data.js` as `window.QD = {...}`, and tafsir
+  names are in `QD.tn`.
+- Each ayah page has a stable, simple structure:
+  - `<body data-s="1" data-a="1" data-t="tabary" ...>`
+  - `.aya-h .q` — the ayah text (Uthmani script)
+  - `div.tafsir` — the tafsir body; contains only `<br>` and `<span>` tags
+    (`t1` quoted text — not necessarily Quran, `t2/t3/t4` references,
+    `nw` page markers, `qa/qr` special markers).
+- Page size is roughly 50–130 KB. The tafsir text is embedded directly in the HTML;
+  there is no public JSON API for it (probed `/tafseer/_d/`, `/data/*.json`, `*.json` → 404).
+
+## What is implemented
+
+`scrape_quranpedia.py`:
+
+Two explicit operations:
+
+- **Default (no flag): scrape only.** Reads surah names from `quran-data.js`,
+  reads the sitemap, downloads ayah pages concurrently, and writes JSON.
+- **`--docx`: build DOCX only.** No network calls at all; builds purely from
+  per-surah JSON already on disk. (`--no-json` is a hidden alias.) Missing JSON
+  or a locked output file produces an `[error]` and a non-zero exit code.
+
+Both operations support the same two scopes:
+
+- per surah via `--surahs 1`, `--surahs 1-3`, etc.
+- full via `--full` (or `--surahs all`):
+  - scrape mode: every surah in that tafsir's sitemap, plus `<slug>-full.json`
+  - DOCX mode: every surah with JSON on disk, plus `<slug>-full.docx`
+
+Scrape details:
+
+1. Writes **per-surah JSON** at `data/json/<slug>/suraNNN.json` (canonical, resumable).
+2. `--full` additionally writes `data/json/<slug>/<slug>-full.json`, streamed from
+   every surah JSON on disk for that tafsir (partial tafsirs work too).
+3. Stores **both plain text and styled segments**:
+   - `tafsir_text`: clean text with line breaks
+   - `tafsir_segments`: per-line `{text, cls}` runs, so DOCX can style `t1`
+     quoted text (dark red), quoted Quran (`qa/qr` → dark green), references
+     (`t2/nw` → small gray), and parenthetical citations (`t3/t4` → dark green)
+     without storing raw HTML. No italic is ever emitted.
+4. Resumable: existing surah JSON files are skipped unless `--force` is used.
+
+DOCX details:
+
+- one per surah: `data/docx/<slug>/NNN سورة <اسم السورة>.docx`
+  (e.g. `001 سورة الفاتحة.docx`) — no English surah name in headings or filenames
+- one full-tafsir volume with `--full`: `<slug>-full.docx`
+- every DOCX starts with an Arabic **cover page** inside a centered, borderless
+  single-cell table (contents centered horizontally and vertically) containing
+  whatever metadata is available: tafsir name, book, author, death year
+  (`سنة الوفاة`), surah number and ayah count (or surah count for the full volume),
+  mushaf page, scrape date, and source URL. A page break separates the cover from
+  the content.
+- **Collapsible Word outline:** surah headings use outline level 0 and every ayah
+  verse heading uses outline level 1, so verses appear in Word's Navigation Pane
+  and their tafsir can be collapsed/expanded per verse.
+- **Page numbers:** a dynamic Word `PAGE` field is centered in every footer,
+  1 cm from the bottom edge, in **14 pt red** RTL text. No `w:dirty` field flag
+  or `updateFields` setting is written, so Word does not show the external-link
+  warning on open.
+- **Microsoft Word RTL**: document-level `themeFontLang/@w:bidi=ar-SA`, section
+  `w:bidi`, `w:bidi` on every paragraph, logical `w:jc=start` (renders right in RTL),
+  and `w:rtl` + `w:cs` + `w:lang/@w:bidi=ar-SA` on Arabic runs. Size (and optional
+  bold) are written twice — `w:sz`/`w:b` **and** `w:szCs`/`w:bCs` — because Word
+  uses the complex-script variants for Arabic; otherwise 16 pt renders as the
+  11 pt template default. Italic (`w:i`/`w:iCs`) is stripped from all runs and
+  styles. Latin tokens such as `Al-Faatiha` and `1:1`
+  are split into non-RTL runs so Word does not reorder their digits. This is
+  deliberately Word-first; LibreOffice may differ.
+- Default typography: **16 pt tafsir**, **not bold**, **no italic**,
+  **single line spacing** (1.0), no blank spacer paragraphs between tafsir lines.
+  Override with `--font-size`, `--line-spacing`, `--bold-tafsir`.
+- **Page background:** `#F3EEE2` (also sets Word's `displayBackgroundShape`).
+  Override with `--page-color '#RRGGBB'`.
+- **Ayah verse color:** `#0F6B9C`. Override with `--quran-color '#RRGGBB'`.
+- **`t1` color:** `#B22222` (dark red). It is quoted text, not necessarily Quran.
+  Override with `--t1-color '#FF4500'` for orangered.
+- **Ayah text font:** `Kitab`
+- **Tafsir text font:** `KFGQPC Uthman Taha Naskh`
+- **Quran inside tafsir:** `Kitab` (spans with classes `qa`, `qr`, `t3` by default;
+  configurable with `--quran-classes qa,qr,t3,t1`)
+- References/page markers (`t2`, `nw`) stay in Naskh, small gray, never italic.
+
+JSON shape (per surah):
+
+```json
+{
+  "tafsir": {"slug": "tabary", "name": "تفسير الطبري", "book": "...", "author": "...", "source": "..."},
+  "surah": {"number": 1, "name_ar": "الفاتحة", "name_en": "Al-Faatiha", "ayah_count": 7, "page": 1},
+  "source_index": "https://quranpedia.app/tafseer/tabary/index.html",
+  "scraped_at": "...",
+  "ayah_count": 7,
+  "ayahs": [
+    {
+      "surah": 1,
+      "ayah": 1,
+      "key": "1:1",
+      "ayah_text": "﴿بِسۡمِ ٱللَّهِ...﴾",
+      "label": "تفسير سورة الفاتحة - الآية 1",
+      "tafsir_text": "القول في تأويل الاستعاذة\n...",
+      "tafsir_segments": [
+        [{"text": "القول في تأويل الاستعاذة", "cls": []}],
+        [{"text": "تأويل قوله : ", "cls": []},
+         {"text": "( أعوذ )", "cls": ["t3"]},
+         {"text": " .", "cls": []}]
+      ],
+      "source_url": "https://quranpedia.app/tafseer/tabary/sura1-aya1.html"
+    }
+  ]
+}
+```
+
+`--include-html` additionally stores the raw `div.tafsir` HTML in `tafsir_html`.
+`--no-styled` omits `tafsir_segments`; `--no-full-json` skips the `<slug>-full.json`
+file that `--full` would otherwise write.
+
+## Usage
+
+```bash
+pip install -r requirements.txt
+
+# scrape Al-Faatiha from tafsir Tabary -> JSON only
+python scrape_quranpedia.py --tafsirs tabary --surahs 1
+
+# build DOCX only from the JSON already downloaded (no network)
+python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx
+
+# same two scopes for surahs 1-3 across two tafsirs
+python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3
+python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3 --docx
+
+# full mode: scrape everything, then build everything separately
+python scrape_quranpedia.py --tafsirs katheer --full --workers 8
+python scrape_quranpedia.py --tafsirs katheer --full --docx
+
+# all 71 tafsirs (large: ~318k pages, tens of GB of HTML)
+python scrape_quranpedia.py --tafsirs all --full --workers 8
+python scrape_quranpedia.py --tafsirs all --full --docx
+
+# tune fonts / which tafsir classes count as Quran text
+python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx \
+  --tafsir-font "KFGQPC Uthman Taha Naskh" --quran-font Kitab \
+  --quran-classes qa,qr,t3,t1 --t1-color '#FF4500'
+```
+
+## Tested sample
+
+`data/json/tabary/sura001.json`, `data/docx/tabary/001 سورة الفاتحة.docx`,
+and `data/docx/tabary/tabary-full.docx` were generated and verified: Word RTL
+flags present at document/section/paragraph/run levels, Arabic text and line
+breaks preserved, styled runs present, plain text exactly matches the segments,
+font mapping is correct (Kitab for ayah/Quran, KFGQPC Uthman Taha Naskh for
+tafsir), typography is 16 pt non-bold non-italic with single line spacing,
+page color is `#F3EEE2`, ayah verses are `#0F6B9C`, verse paragraphs carry Word
+outline level 1 for collapsing, and `t1` spans are `#B22222`.
+
+## Decisions confirmed so far
+
+- Modes: default = scrape only; `--docx` = build DOCX only, no network. ✅
+- Both modes support per-surah (`--surahs`) and full (`--full`) scopes. ✅
+- JSON: per-surah files; `--full` additionally writes `<slug>-full.json`. ✅
+- DOCX: per-surah files plus `<slug>-full.docx` with `--full`; no combined range.
+  Arabic-only surah names, plus a metadata cover page. ✅
+- `--full` scraping uses each tafsir's sitemap, so partial tafsirs only include
+  surahs they actually have. ✅
+- Text: **plain text + styled runs** (no raw HTML by default). ✅
+- Fonts: **Word RTL throughout**; Kitab for ayah/Quran text, KFGQPC Uthman Taha
+  Naskh for tafsir text. ✅
+- Typography: **16 pt tafsir, not bold, no italic, single line spacing**;
+  page color `#F3EEE2`; ayah verses `#0F6B9C`; `t1` spans `#B22222`;
+  collapsible verse headings (Word outline level 1); per-surah DOCX named
+  `NNN سورة <الاسم>.docx`. ✅
+- Tafsir scope: waiting for your shortlist of slugs.
+
+## Still open (optional)
+
+- Should one DOCX ever contain several tafsirs for the same surah (sequential or
+  side-by-side table)? Currently each DOCX holds one tafsir.
+- Include source URLs under every ayah in DOCX? Currently opt-in via
+  `--include-source`.
