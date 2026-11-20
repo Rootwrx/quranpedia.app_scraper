@@ -5,14 +5,14 @@ The books section is separate from the ayah-based tafsir/uloom pipeline:
   index:   https://quranpedia.app/books/index.html
   landing: https://quranpedia.app/books/b373/index.html
   sitemap: https://quranpedia.app/sitemap-books-b373.xml
-  parts:   https://quranpedia.app/books/b373/s1.html, s2.html, ...
+  abwab:   https://quranpedia.app/books/b373/s1.html, s2.html, ...
 
 Modes
 -----
   default          scrape selected books into JSON only
   --docx           build DOCX only from local JSON (no network calls)
-  --full           scrape/build every part and additionally write full JSON/DOCX
-  --parts SPEC     limit parts, e.g. 1,2,5-8 or all (default: 1)
+  --full           scrape/build every bab and additionally write full JSON/DOCX
+  --parts SPEC     limit abwab, e.g. 1,2,5-8 or all (default: 1)
 
 Selection
 ---------
@@ -1154,8 +1154,8 @@ def add_book_cover(doc, meta: Dict[str, Any], part_numbers: Sequence[int],
         ("الطبعة", meta.get("edition", "")),
         ("التصنيف", (meta.get("category") or {}).get("name", "")),
         ("عدد صفحات المطبوع", str(meta.get("printed_pages", "")) if meta.get("printed_pages") else ""),
-        ("عدد الأجزاء في الموقع", str(meta.get("part_count", "")) if meta.get("part_count") else ""),
-        ("الأجزاء المضمّنة", "كتاب كامل" if full_book else
+        ("عدد الأبواب في الموقع", str(meta.get("part_count", "")) if meta.get("part_count") else ""),
+        ("الأبواب المضمّنة", "كتاب كامل" if full_book else
          ", ".join(str(n) for n in part_numbers)),
         ("اللغة", meta.get("language", "")),
         ("تاريخ الجمع", meta.get("scraped_at", "")),
@@ -1357,13 +1357,18 @@ def add_book_metadata(doc, meta: Dict[str, Any], *, font: str, size: float,
     doc.add_page_break()
 
 
+def without_juz_prefix(text: str) -> str:
+    """Drop the site's printed 'الجزء N ·' prefix from generated DOCX labels."""
+    return re.sub(r"الجزء\s+\d+\s*·\s*", "", clean_text(text)).strip()
+
+
 def render_part(doc, part: Dict[str, Any], *, font: str, size: float,
                 line_spacing: float, quran_font: str,
                 quran_color: Tuple[int, int, int],
                 t1_color: Tuple[int, int, int], bold: bool,
                 include_source: bool) -> None:
-    title = part.get("title") or ""
-    heading = f"الجزء {part.get('part', '')}"
+    title = without_juz_prefix(part.get("title") or "")
+    heading = f"الباب {part.get('part', '')}"
     if title:
         heading += f" — {title}"
     add_section_heading(doc, heading, font, size, line_spacing, level=0)
@@ -1371,7 +1376,8 @@ def render_part(doc, part: Dict[str, Any], *, font: str, size: float,
     pages = part.get("pages", [])
     for page in pages:
         if len(pages) > 1 and page.get("data_loc"):
-            sq.add_paragraph(doc, page["data_loc"], size=size - 2, color=GRAY,
+            loc = without_juz_prefix(page["data_loc"])
+            sq.add_paragraph(doc, loc, size=size - 2, color=GRAY,
                              font_name=font, line_spacing=line_spacing, space_after=2)
         add_blocks(doc, page.get("blocks", []), font=font, size=size,
                    line_spacing=line_spacing, quran_font=quran_font,
@@ -1547,9 +1553,9 @@ def parse_args(argv: Optional[Sequence[str]] = None) -> argparse.Namespace:
                         help="select one category by slug or Arabic name (repeatable)")
 
     p.add_argument("--parts", default="1",
-                   help="parts to process: 1, 1-3, 1,4,7-9, or all (default: 1)")
+                   help="abwab (sN.html) to process: 1, 1-3, 1,4,7-9, or all (default: 1)")
     p.add_argument("--full", action="store_true",
-                   help="process every part and write full JSON/DOCX in addition to per-part files")
+                   help="process every bab and write full JSON/DOCX in addition to per-bab files")
     p.add_argument("--docx", action="store_true", dest="build_only",
                    help="build DOCX only from local JSON; no network calls")
     p.add_argument("--workers", type=int, default=6, help="concurrent requests (default: 6)")

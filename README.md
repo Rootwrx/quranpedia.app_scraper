@@ -62,8 +62,10 @@ title, alternate names, author (including century, death date, biography and
 other works), editor, publisher, edition, printed page count, language,
 description, about, content, importance, edition details, source evidence, full
 table of contents, and related books. Each sitemap
-(`https://quranpedia.app/sitemap-books-bNNN.xml`) supplies the part pages
-(`s1.html`, `s2.html`, …). Part pages preserve printed locations (`data-loc`),
+(`https://quranpedia.app/sitemap-books-bNNN.xml`) supplies the chapter pages
+(`s1.html`, `s2.html`, …). The site calls these **أبواب** (singular: باب), so DOCX
+headings use `الباب N`, not `الجزء N`. The JSON key `parts/` is kept for
+compatibility. Chapter pages preserve printed locations (`data-loc`),
 headings, Quran quotes, folio markers, footnotes and plain text/styled segments.
 No raw HTML is stored unless `--include-html` is used.
 
@@ -84,17 +86,17 @@ title, not `bNNN`. Duplicate titles are disambiguated with the author name, and
 exact duplicates get a numeric suffix. Legacy `bNNN` folders are moved
 automatically on the next scrape. Every DOCX begins with a full book record (cover plus
 بطاقة الكتاب, author, description, sources, TOC and related books) before the
-part text. Styling reuses the existing Word-first RTL pipeline: `#F3EEE2` page
+chapter text. Styling reuses the existing Word-first RTL pipeline: `#F3EEE2` page
 color, `Kitab` for Quran text, `KFGQPC Uthman Taha Naskh` for body text, 16 pt
 non-bold/non-italic, red dynamic `PAGE` footer, and collapsible outline headings.
 
 Selection is explicit:
 
 ```bash
-# shortlist: scrape part 1 only
+# shortlist: scrape bab 1 only
 python scrape_books.py --books b373,b11728 --parts 1
 
-# shortlist: every part plus full.json and per-part/full DOCX
+# shortlist: every bab plus full.json and per-bab/full DOCX
 python scrape_books.py --books b373 --full
 python scrape_books.py --books b373 --full --docx
 
@@ -109,7 +111,7 @@ python scrape_books.py --all --full --docx
 
 `--docx` is local-only and never touches the network. Missing JSON or a locked
 DOCX output is reported with `[error]` and exits `1`, matching the main scraper.
-Verified samples include `b373` (1 part, 5 printed pages), `b11728` (107 parts,
+Verified samples include `b373` (1 bab, 5 printed pages), `b11728` (107 abwab,
 83-entry TOC), and `b38075` (footnotes preserved in JSON and DOCX).
 
 ## What is implemented
