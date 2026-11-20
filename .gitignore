@@ -1,18 +1,5 @@
-# Python
-__pycache__/
-*.py[cod]
-*.egg-info/
-.pytest_cache/
-
-# Generated scraper output (can be large; regenerate with the CLI)
-data/
-
-# Office / editor lock and temp files
-.~lock.*#
-~$*
-*.tmp
-*.swp
-
-# OS files
-.DS_Store
-Thumbs.db
+# Ignore everything except the script, README, and this ignore file.
+*
+!.gitignore
+!README.md
+!scrape_quranpedia.py
