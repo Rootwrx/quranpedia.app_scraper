@@ -1,6 +1,7 @@
-# QuranPedia tafsir scraper
+# QuranPedia scraper
 
-Investigation + working scraper for <https://quranpedia.app/tafseer/index.html>.
+Investigation + working scraper for <https://quranpedia.app/tafseer/index.html>
+and the ayah-based books at <https://quranpedia.app/uloom/index.html>.
 
 ## What the investigation found
 
@@ -23,6 +24,31 @@ Investigation + working scraper for <https://quranpedia.app/tafseer/index.html>.
 - Page size is roughly 50–130 KB. The tafsir text is embedded directly in the HTML;
   there is no public JSON API for it (probed `/tafseer/_d/`, `/data/*.json`, `*.json` → 404).
 
+## Uloom al-Quran support
+
+Use `--source uloom` (or the shorthand `--uloom`) to read the
+[`uloom` index](https://quranpedia.app/uloom/index.html) instead of the tafsir
+index. The 78 uloom books split into two groups:
+
+- **69 ayah-based books** (134,210 ayah pages) are structurally identical to
+  tafsirs: same `sitemap-<slug>.xml`, same `suraN-ayaM.html` URLs, same
+  `<body data-s/data-a>`, `.aya-h .q`, `div.tafsir`, and `h1.tbh .loc`. They are
+  scraped and built with exactly the same parser and DOCX code as tafsirs.
+  `--tafsirs all` with `--source uloom` selects these 69 books. The sitemap is
+  the source of truth for coverage; card counts can differ when one page covers
+  multiple ayahs (e.g. `2>1`).
+- **9 word/root dictionaries** (`raghib`, `umdah`, `ishtiqaqi`, `maqayees`,
+  `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are not ayah-based. Their
+  sitemaps list `/w/<root>.html` entries with `.well` content. Their `sura*.html`
+  URLs are byte-identical Baghawy tafsir pages, so they are skipped with a
+  warning for `--tafsirs all` and rejected with `[error]` if named explicitly.
+  They need a separate word-entry scraper/output format.
+
+Uloom slugs do not collide with tafsir slugs, so output directories remain
+separate (`data/json/<slug>/`, `data/docx/<slug>/`). You can also point
+`--json-dir`/`--docx-dir` at separate roots, and `--combine` accepts any mix of
+local tafsir and uloom JSON slugs.
+
 ## What is implemented
 
 `scrape_quranpedia.py`:
@@ -37,6 +63,10 @@ Three explicit operations:
 - **`--combine katheer,saadi`: build combined DOCX.** Implies `--docx`; reads
   only local JSON. Output is structured as each verse followed by that verse's
   tafsir from every selected tafsir, in the order given.
+
+`--source tafseer` (default) and `--source uloom` select the book index for the
+scrape and DOCX operations. `--combine` is local-only and accepts slugs from
+either source.
 
 All three operations support the same two scopes:
 
@@ -164,10 +194,18 @@ python scrape_quranpedia.py --tafsirs katheer --full --docx
 python scrape_quranpedia.py --tafsirs all --full --workers 8
 python scrape_quranpedia.py --tafsirs all --full --docx
 
+# uloom al-Quran: same pipeline, different index
+python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
+python scrape_quranpedia.py --uloom --tafsirs nashr --full
+python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
+
 # combine tafsirs from local JSON: verse, then each tafsir under it
 python scrape_quranpedia.py --combine katheer,saadi --surahs 2
 python scrape_quranpedia.py --combine katheer,saadi --full
 python scrape_quranpedia.py --combine katheer,saadi --full --combine-name "katheer-saadi"
+
+# combine local uloom JSON too (any mix of tafsir/uloom slugs works)
+python scrape_quranpedia.py --combine asbab,qutayba --surahs 1
 
 # tune fonts / which tafsir classes count as Quran text
 python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx \
@@ -189,6 +227,10 @@ outline level 1 for collapsing, and `t1` spans are `#B22222`.
 `data/docx/combined/tabary-turath-hadir/tabary-turath-hadir-full.docx` were also
 verified: each verse is followed by one outline-level-2 heading per tafsir, with
 the original per-tafsir styling preserved.
+`data/json/asbab/sura001.json`, `data/json/qutayba/sura001.json`, and their
+per-surah DOCX files were also generated with `--source uloom` and verified to
+carry `/uloom/...` source URLs and correct uloom book metadata. A local
+`--combine asbab,qutayba --surahs 1` build was verified as well.
 
 ## Decisions confirmed so far
 
@@ -208,9 +250,12 @@ the original per-tafsir styling preserved.
   page color `#F3EEE2`; ayah verses `#0F6B9C`; `t1` spans `#B22222`;
   collapsible verse/tafsir headings (Word outline levels 1/2); per-surah DOCX
   named `NNN سورة <الاسم>.docx`. ✅
+- Uloom: 69 ayah-based books reuse the current scraper via `--source uloom`;
+  the 9 word/root dictionaries are explicitly unsupported by this pipeline. ✅
 - Tafsir scope: waiting for your shortlist of slugs.
 
 ## Still open (optional)
 
 - Include source URLs under every ayah in DOCX? Currently opt-in via
   `--include-source` (in combine mode, the source is repeated per tafsir).
+- A separate word/root-entry scraper + DOCX layout for the 9 uloom dictionaries.

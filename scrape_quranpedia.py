@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Scrape QuranPedia tafsir pages into JSON and build DOCX files.
+"""Scrape QuranPedia tafsir/uloom pages into JSON and build DOCX files.
 
 The site is fully static: every tafsir has a sitemap listing one HTML page per
 ayah. Example: https://quranpedia.app/tafseer/tabary/sura1-aya1.html
@@ -19,6 +19,11 @@ Usage examples
   # combine tafsirs from local JSON: each verse, then its tafsir from each book
   python scrape_quranpedia.py --combine katheer,saadi --surahs 2
   python scrape_quranpedia.py --combine katheer,saadi --full
+
+  # uloom al-Quran books use the same page structure and sitemaps
+  python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
+  python scrape_quranpedia.py --uloom --tafsirs nashr --full
+  python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
 
   # everything, 12 workers
   python scrape_quranpedia.py --tafsirs all --full --workers 12
@@ -55,6 +60,16 @@ BASE = "https://quranpedia.app"
 SITEMAP_INDEX = f"{BASE}/sitemap.xml"
 QURAN_DATA_JS = f"{BASE}/assets/quran-data.js"
 TAFSEER_INDEX = f"{BASE}/tafseer/index.html"
+ULOOM_INDEX = f"{BASE}/uloom/index.html"
+SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
+
+# These uloom books are word/root dictionaries: their sitemaps list /w/*.html
+# entries, not suraN-ayaM.html pages. Their sura*.html URLs exist but are just
+# Baghawy tafsir pages, so they must not be fed to the ayah-based pipeline.
+ULOOM_WORD_SLUGS = frozenset({
+    "raghib", "umdah", "ishtiqaqi", "maqayees", "sihah", "lisan",
+    "qamoos", "tamyeez", "jothur",
+})
 
 USER_AGENT = "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)"
 
@@ -130,19 +145,28 @@ def load_quran_data() -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
     )
 
 
-def get_all_tafsir_slugs() -> List[str]:
-    html = fetch_text(TAFSEER_INDEX)
+def get_all_slugs(source: str = "tafseer") -> List[str]:
+    """Read book slugs from the tafseer or uloom index page."""
+    index_url = TAFSEER_INDEX if source == "tafseer" else ULOOM_INDEX
+    html = fetch_text(index_url)
     return sorted(set(re.findall(r'href="\./([a-z0-9-]+)/index\.html"', html)))
 
 
-def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
-    """Read book metadata from the tafsir index page JSON-LD block."""
+def get_all_tafsir_slugs() -> List[str]:
+    """Backward-compatible wrapper for the tafsir-only index."""
+    return get_all_slugs("tafseer")
+
+
+def get_book_meta(slug: str, names: Dict[str, str],
+                  source: str = "tafseer") -> dict:
+    """Read book metadata from a tafseer/uloom index page JSON-LD block."""
+    path = SOURCE_PATHS[source]
     meta = {
         "slug": slug,
         "name": names.get(slug, slug),
         "book": "",
         "author": "",
-        "source": f"{BASE}/tafseer/{slug}/index.html",
+        "source": f"{BASE}/{path}/{slug}/index.html",
     }
     try:
         html = fetch_text(meta["source"])
@@ -160,6 +184,11 @@ def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
     except Exception:  # noqa: BLE001 - metadata is best-effort
         pass
     return meta
+
+
+def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
+    """Backward-compatible wrapper for tafsir metadata."""
+    return get_book_meta(slug, names, "tafseer")
 
 
 def get_ayah_urls(slug: str) -> Dict[Tuple[int, int], str]:
@@ -251,7 +280,8 @@ def parse_ayah_page(html: str, slug: str, surah: int, ayah: int, url: str,
 
 
 def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
-                 tafsir_meta: dict, surah_meta: dict, out_dir: Path, args) -> Path:
+                 tafsir_meta: dict, surah_meta: dict, out_dir: Path, args,
+                 source: str = "tafseer") -> Path:
     """Scrape one surah into <json_dir>/<slug>/suraNNN.json."""
     (out_dir / slug).mkdir(parents=True, exist_ok=True)
     out_path = out_dir / slug / f"sura{surah:03d}.json"
@@ -288,14 +318,15 @@ def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
             except Exception as exc:  # noqa: BLE001
                 print(f"[error] {slug} {s}:{a}: {exc}", file=sys.stderr)
 
+    path = SOURCE_PATHS[source]
     payload = {
         "tafsir": tafsir_meta,
         "surah": surah_meta,
-        "source_index": f"{BASE}/tafseer/{slug}/index.html",
+        "source_index": f"{BASE}/{path}/{slug}/index.html",
         "ayah_count": len(results),
         "ayahs": [results[k] for k in sorted(results)],
     }
-    payload["source_url"] = f"{BASE}/tafseer/{slug}/"
+    payload["source_url"] = f"{BASE}/{path}/{slug}/"
     payload["scraped_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     tmp = out_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -1284,7 +1315,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tafsirs", default="tabary",
-                   help="comma-separated slugs, or 'all' (default: tabary)")
+                   help="comma-separated tafsir/book slugs, or 'all' (default: tabary)")
+    p.add_argument("--source", choices=sorted(SOURCE_PATHS), default="tafseer",
+                   help="book index to use: tafseer (default) or uloom")
+    p.add_argument("--uloom", action="store_const", dest="source", const="uloom",
+                   help="shorthand for --source uloom")
     p.add_argument("--combine",
                    help="comma-separated tafsir slugs to merge into one DOCX; "
                         "implies --docx and reads local JSON only "
@@ -1347,6 +1382,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-source", action="store_true",
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
+    source = args.source
     args.styled = not args.no_styled
     quran_classes = {c.strip() for c in args.quran_classes.split(",") if c.strip()}
     quran_color = hex_to_rgb(args.quran_color)
@@ -1376,23 +1412,49 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if not combine_slugs:
+        wants_all = args.tafsirs.strip().lower() in ("all", "*")
         if build_only:
-            if args.tafsirs.strip().lower() == "all":
+            if wants_all:
                 slugs = sorted(
                     path.name for path in args.json_dir.iterdir()
                     if path.is_dir() and not path.name.startswith("~")
                 ) if args.json_dir.exists() else []
+                if source == "uloom":
+                    skipped = [s for s in slugs if s in ULOOM_WORD_SLUGS]
+                    if skipped:
+                        print(f"[warn] skipping {len(skipped)} unsupported word-based "
+                              f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
+                        slugs = [s for s in slugs if s not in ULOOM_WORD_SLUGS]
             else:
                 slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
             if not slugs:
                 print("No tafsir JSON directories found for --docx", file=sys.stderr)
                 return 1
         else:
-            slugs = get_all_tafsir_slugs() if args.tafsirs.strip().lower() == "all" else [
-                s.strip() for s in args.tafsirs.split(",") if s.strip()
-            ]
+            if wants_all:
+                all_slugs = get_all_slugs(source)
+                if source == "uloom":
+                    skipped = [s for s in all_slugs if s in ULOOM_WORD_SLUGS]
+                    if skipped:
+                        print(f"[warn] skipping {len(skipped)} unsupported word-based "
+                              f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
+                    slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS]
+                else:
+                    slugs = all_slugs
+            else:
+                slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
 
-    print(f"Tafsirs: {len(slugs)} | workers={args.workers} | "
+        if source == "uloom" and not wants_all:
+            bad = [s for s in slugs if s in ULOOM_WORD_SLUGS]
+            if bad:
+                print(f"[error] {', '.join(bad)}: word-based uloom book(s) are not "
+                      f"supported by --source uloom; they need a word-entry scraper",
+                      file=sys.stderr)
+                return 1
+
+    label = "Books" if source == "uloom" else "Tafsirs"
+    source_label = "local" if combine_slugs else source
+    print(f"{label}: {len(slugs)} | source={source_label} | workers={args.workers} | "
           f"mode={mode} | scope={'FULL' if full_mode else f'surahs {surahs}'}")
     if combine_slugs:
         print(f"[combine] {' + '.join(combine_slugs)} -> "
@@ -1467,7 +1529,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     any_error = True
             continue
 
-        tafsir_meta = get_tafsir_meta(slug, names)
+        tafsir_meta = get_book_meta(slug, names, source)
         urls = get_ayah_urls(slug)
         surahs_for_slug = sorted({s for (s, _a) in urls}) if full_mode else surahs
         if full_mode:
@@ -1475,7 +1537,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         for s in surahs_for_slug:
             sm = next((x for x in surah_meta if x["number"] == s), {"number": s})
-            scrape_surah(slug, s, urls, tafsir_meta, sm, args.json_dir, args)
+            scrape_surah(slug, s, urls, tafsir_meta, sm, args.json_dir, args,
+                         source=source)
         if full_mode and not args.no_full_json:
             write_full_json(slug, args.json_dir)
     return 1 if any_error else 0
