@@ -1,5 +1,6 @@
-# Ignore everything except the script, README, and this ignore file.
+# Ignore everything except the script, README, requirements, and this ignore file.
 *
 !.gitignore
 !README.md
+!requirements.txt
 !scrape_quranpedia.py
