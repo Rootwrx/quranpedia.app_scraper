@@ -49,6 +49,66 @@ separate (`data/json/<slug>/`, `data/docx/<slug>/`). You can also point
 `--json-dir`/`--docx-dir` at separate roots, and `--combine` accepts any mix of
 local tafsir and uloom JSON slugs.
 
+## Books library support
+
+`scrape_books.py` is a separate script for the [books library](https://quranpedia.app/books/index.html).
+The library has **21 categories** and **597 actual book pages** (`/books/bNNN/`).
+The category counts shown on the site add up to 757 because some categories also
+count tafsir/uloom cross-links; the script saves both the declared count and the
+observed book-card count.
+
+For every book it reads the landing page JSON-LD plus all descriptive sections:
+title, alternate names, author (including century, death date, biography and
+other works), editor, publisher, edition, printed page count, language,
+description, about, content, importance, edition details, source evidence, full
+table of contents, and related books. Each sitemap
+(`https://quranpedia.app/sitemap-books-bNNN.xml`) supplies the part pages
+(`s1.html`, `s2.html`, …). Part pages preserve printed locations (`data-loc`),
+headings, Quran quotes, folio markers, footnotes and plain text/styled segments.
+No raw HTML is stored unless `--include-html` is used.
+
+Output is category-first:
+
+```
+data/books/catalog.json
+data/books/json/<category>/<bNNN>/meta.json
+data/books/json/<category>/<bNNN>/parts/s001.json
+data/books/json/<category>/<bNNN>/full.json        # --full only
+data/books/docx/<category>/<bNNN>/s001.docx
+data/books/docx/<category>/<bNNN>/<bNNN>-full.docx # --full only
+```
+
+Category folders use the Arabic category name by default; `--category-style slug`
+uses the URL slug instead. Every DOCX begins with a full book record (cover plus
+بطاقة الكتاب, author, description, sources, TOC and related books) before the
+part text. Styling reuses the existing Word-first RTL pipeline: `#F3EEE2` page
+color, `Kitab` for Quran text, `KFGQPC Uthman Taha Naskh` for body text, 16 pt
+non-bold/non-italic, red dynamic `PAGE` footer, and collapsible outline headings.
+
+Selection is explicit:
+
+```bash
+# shortlist: scrape part 1 only
+python scrape_books.py --books b373,b11728 --parts 1
+
+# shortlist: every part plus full.json and per-part/full DOCX
+python scrape_books.py --books b373 --full
+python scrape_books.py --books b373 --full --docx
+
+# one category by Arabic name or URL slug
+python scrape_books.py --category "إعراب القرآن" --parts 1
+python scrape_books.py --category iraab --parts 1 --docx
+
+# all 597 books (no scraping happens until you run one of these)
+python scrape_books.py --all --parts 1 --workers 8
+python scrape_books.py --all --full --docx
+```
+
+`--docx` is local-only and never touches the network. Missing JSON or a locked
+DOCX output is reported with `[error]` and exits `1`, matching the main scraper.
+Verified samples include `b373` (1 part, 5 printed pages), `b11728` (107 parts,
+83-entry TOC), and `b38075` (footnotes preserved in JSON and DOCX).
+
 ## What is implemented
 
 `scrape_quranpedia.py`:
