@@ -27,20 +27,25 @@ Investigation + working scraper for <https://quranpedia.app/tafseer/index.html>.
 
 `scrape_quranpedia.py`:
 
-Two explicit operations:
+Three explicit operations:
 
 - **Default (no flag): scrape only.** Reads surah names from `quran-data.js`,
   reads the sitemap, downloads ayah pages concurrently, and writes JSON.
 - **`--docx`: build DOCX only.** No network calls at all; builds purely from
   per-surah JSON already on disk. (`--no-json` is a hidden alias.) Missing JSON
   or a locked output file produces an `[error]` and a non-zero exit code.
+- **`--combine katheer,saadi`: build combined DOCX.** Implies `--docx`; reads
+  only local JSON. Output is structured as each verse followed by that verse's
+  tafsir from every selected tafsir, in the order given.
 
-Both operations support the same two scopes:
+All three operations support the same two scopes:
 
 - per surah via `--surahs 1`, `--surahs 1-3`, etc.
 - full via `--full` (or `--surahs all`):
   - scrape mode: every surah in that tafsir's sitemap, plus `<slug>-full.json`
   - DOCX mode: every surah with JSON on disk, plus `<slug>-full.docx`
+  - combine mode: the union of surahs available across the selected tafsirs,
+    plus `<label>-full.docx`
 
 Scrape details:
 
@@ -60,15 +65,22 @@ DOCX details:
 - one per surah: `data/docx/<slug>/NNN سورة <اسم السورة>.docx`
   (e.g. `001 سورة الفاتحة.docx`) — no English surah name in headings or filenames
 - one full-tafsir volume with `--full`: `<slug>-full.docx`
+- combined volumes with `--combine katheer,saadi`:
+  `data/docx/combined/katheer-saadi/NNN سورة <اسم السورة>.docx`, or
+  `data/docx/combined/katheer-saadi/katheer-saadi-full.docx` with `--full`.
+  Use `--combine-name` to change the folder/file prefix. Every selected tafsir
+  must have JSON for each requested surah; missing files are reported and cause
+  exit code 1.
 - every DOCX starts with an Arabic **cover page** inside a centered, borderless
   single-cell table (contents centered horizontally and vertically) containing
   whatever metadata is available: tafsir name, book, author, death year
   (`سنة الوفاة`), surah number and ayah count (or surah count for the full volume),
   mushaf page, scrape date, and source URL. A page break separates the cover from
   the content.
-- **Collapsible Word outline:** surah headings use outline level 0 and every ayah
-  verse heading uses outline level 1, so verses appear in Word's Navigation Pane
-  and their tafsir can be collapsed/expanded per verse.
+- **Collapsible Word outline:** surah headings use outline level 0, every ayah
+  verse heading uses outline level 1, and combined-DOCX tafsir headings use
+  outline level 2. Verses and individual tafsirs appear in Word's Navigation
+  Pane and can be collapsed/expanded.
 - **Page numbers:** a dynamic Word `PAGE` field is centered in every footer,
   1 cm from the bottom edge, in **14 pt red** RTL text. No `w:dirty` field flag
   or `updateFields` setting is written, so Word does not show the external-link
@@ -152,6 +164,11 @@ python scrape_quranpedia.py --tafsirs katheer --full --docx
 python scrape_quranpedia.py --tafsirs all --full --workers 8
 python scrape_quranpedia.py --tafsirs all --full --docx
 
+# combine tafsirs from local JSON: verse, then each tafsir under it
+python scrape_quranpedia.py --combine katheer,saadi --surahs 2
+python scrape_quranpedia.py --combine katheer,saadi --full
+python scrape_quranpedia.py --combine katheer,saadi --full --combine-name "katheer-saadi"
+
 # tune fonts / which tafsir classes count as Quran text
 python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx \
   --tafsir-font "KFGQPC Uthman Taha Naskh" --quran-font Kitab \
@@ -168,6 +185,10 @@ font mapping is correct (Kitab for ayah/Quran, KFGQPC Uthman Taha Naskh for
 tafsir), typography is 16 pt non-bold non-italic with single line spacing,
 page color is `#F3EEE2`, ayah verses are `#0F6B9C`, verse paragraphs carry Word
 outline level 1 for collapsing, and `t1` spans are `#B22222`.
+`data/docx/combined/katheer-saadi/002 سورة البقرة.docx` and
+`data/docx/combined/tabary-turath-hadir/tabary-turath-hadir-full.docx` were also
+verified: each verse is followed by one outline-level-2 heading per tafsir, with
+the original per-tafsir styling preserved.
 
 ## Decisions confirmed so far
 
@@ -176,6 +197,8 @@ outline level 1 for collapsing, and `t1` spans are `#B22222`.
 - JSON: per-surah files; `--full` additionally writes `<slug>-full.json`. ✅
 - DOCX: per-surah files plus `<slug>-full.docx` with `--full`; no combined range.
   Arabic-only surah names, plus a metadata cover page. ✅
+- `--combine` merges selected tafsirs locally into verse-first DOCX files, with
+  one level-2 tafsir heading per selected tafsir under each verse. ✅
 - `--full` scraping uses each tafsir's sitemap, so partial tafsirs only include
   surahs they actually have. ✅
 - Text: **plain text + styled runs** (no raw HTML by default). ✅
@@ -183,13 +206,11 @@ outline level 1 for collapsing, and `t1` spans are `#B22222`.
   Naskh for tafsir text. ✅
 - Typography: **16 pt tafsir, not bold, no italic, single line spacing**;
   page color `#F3EEE2`; ayah verses `#0F6B9C`; `t1` spans `#B22222`;
-  collapsible verse headings (Word outline level 1); per-surah DOCX named
-  `NNN سورة <الاسم>.docx`. ✅
+  collapsible verse/tafsir headings (Word outline levels 1/2); per-surah DOCX
+  named `NNN سورة <الاسم>.docx`. ✅
 - Tafsir scope: waiting for your shortlist of slugs.
 
 ## Still open (optional)
 
-- Should one DOCX ever contain several tafsirs for the same surah (sequential or
-  side-by-side table)? Currently each DOCX holds one tafsir.
 - Include source URLs under every ayah in DOCX? Currently opt-in via
-  `--include-source`.
+  `--include-source` (in combine mode, the source is repeated per tafsir).

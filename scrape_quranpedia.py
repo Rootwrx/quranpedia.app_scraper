@@ -16,6 +16,10 @@ Usage examples
   python scrape_quranpedia.py --tafsirs tabary --full
   python scrape_quranpedia.py --tafsirs tabary --full --docx
 
+  # combine tafsirs from local JSON: each verse, then its tafsir from each book
+  python scrape_quranpedia.py --combine katheer,saadi --surahs 2
+  python scrape_quranpedia.py --combine katheer,saadi --full
+
   # everything, 12 workers
   python scrape_quranpedia.py --tafsirs all --full --workers 12
 
@@ -66,6 +70,7 @@ T1_COLOR = "B22222"              # dark red for t1 spans (not necessarily Quran)
 PAGE_NUMBER_COLOR = (0xFF, 0x00, 0x00)  # red footer page number
 SURAH_HEADING_STYLE = "Surah Heading"   # outline level 0
 VERSE_HEADING_STYLE = "Verse Heading"   # outline level 1
+TAFSIR_HEADING_STYLE = "Tafsir Heading"  # outline level 2 (combined DOCX)
 
 
 def parse_hex_color(value: str) -> str:
@@ -649,6 +654,7 @@ def style_document(doc, font_name: str, font_size: float, page_color: str) -> No
     # Heading styles with outline levels make surahs/verses collapsible in Word.
     ensure_outline_style(doc, SURAH_HEADING_STYLE, 0)
     ensure_outline_style(doc, VERSE_HEADING_STYLE, 1)
+    ensure_outline_style(doc, TAFSIR_HEADING_STYLE, 2)
 
     for section in doc.sections:
         section.top_margin = Cm(2)
@@ -746,6 +752,90 @@ def add_styled_line(doc, segments: List[dict], size: float, tafsir_font: str,
             color = (11, 74, 49)  # parenthetical citation
         add_text_runs(p, text, font_name=font_name, size=seg_size,
                       bold=bold, color=color)
+
+
+def load_surah_json(slug: str, surah: int, json_dir: Path, *,
+                    warn: bool = True) -> Optional[dict]:
+    """Load one per-surah JSON file without touching the network."""
+    path = json_dir / slug / f"sura{surah:03d}.json"
+    if not path.exists():
+        if warn:
+            print(f"[error] missing JSON {path}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        if warn:
+            print(f"[error] cannot read JSON {path}: {exc}", file=sys.stderr)
+        return None
+
+
+def surah_docx_filename(surah: int, data: Optional[dict] = None) -> str:
+    name_ar = ""
+    if data is not None:
+        name_ar = (data.get("surah") or {}).get("name_ar", "")
+    name_ar = re.sub(r'[\\/:*?"<>|]', "", str(name_ar)).strip()
+    return f"{surah:03d} سورة {name_ar}.docx" if name_ar else f"{surah:03d}.docx"
+
+
+def tafsir_label(data: Optional[dict], slug: str) -> str:
+    if data is not None:
+        name = (data.get("tafsir") or {}).get("name")
+        if name:
+            return str(name)
+    return slug
+
+
+def add_tafsir_body(doc, item: dict, *, font_name: str, font_size: float,
+                    quran_font: str, quran_classes: set, bold: bool,
+                    line_spacing: float, t1_color: Tuple[int, int, int],
+                    include_source: bool) -> None:
+    """Write one ayah's tafsir body (styled segments + optional source)."""
+    segments = item.get("tafsir_segments")
+    if segments:
+        for line in segments:
+            add_styled_line(doc, line, font_size, font_name, quran_font,
+                            quran_classes, bold=bold,
+                            line_spacing=line_spacing,
+                            t1_color=t1_color)
+    else:
+        for line in str(item.get("tafsir_text", "")).split("\n"):
+            add_paragraph(doc, line, size=font_size, font_name=font_name,
+                          bold=bold, line_spacing=line_spacing)
+    if include_source:
+        add_paragraph(doc, item.get("source_url", ""), size=font_size - 2,
+                      color=(110, 110, 110), font_name=font_name,
+                      line_spacing=line_spacing)
+
+
+def combined_output_label(slugs: List[str], name: Optional[str] = None) -> str:
+    """Safe folder/file prefix for a combined run."""
+    raw = name or "-".join(slugs)
+    safe = re.sub(r"[\\/:*?\"<>|\s]+", "-", raw.strip()).strip("-")
+    return safe or "combined"
+
+
+def combined_cover_data(datas: List[dict], slugs: List[str]) -> dict:
+    """Build cover metadata that lists all combined tafsirs."""
+    base = dict(datas[0])
+    names = [tafsir_label(data, slug) for data, slug in zip(datas, slugs)]
+    meta = dict(base.get("tafsir") or {})
+    meta["name"] = " + ".join(names)
+    books = [str((data.get("tafsir") or {}).get("book", "")).strip()
+             for data in datas]
+    authors = [str((data.get("tafsir") or {}).get("author", "")).strip()
+               for data in datas]
+    if any(books):
+        meta["book"] = " + ".join(b for b in books if b)
+    if any(authors):
+        meta["author"] = " + ".join(a for a in authors if a)
+    meta.pop("death_hijri", None)  # meaningless for a multi-tafsir volume
+    base["tafsir"] = meta
+    base["source_index"] = "\n".join(
+        str(data.get("source_index") or (data.get("tafsir") or {}).get("source", ""))
+        for data in datas
+    )
+    return base
 
 
 TBL_PR_ORDER = [
@@ -919,17 +1009,8 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
         groups.append((surahs, docx_dir / slug / f"{slug}-full.docx"))
     else:
         for s in surahs:
-            json_path = json_dir / slug / f"sura{s:03d}.json"
-            name_ar = ""
-            if json_path.exists():
-                try:
-                    name_ar = json.loads(json_path.read_text(encoding="utf-8")) \
-                        .get("surah", {}).get("name_ar", "")
-                except (OSError, ValueError):
-                    pass
-            name_ar = re.sub(r'[\\/:*?"<>|]', "", name_ar).strip()
-            filename = f"{s:03d} سورة {name_ar}.docx" if name_ar else f"{s:03d}.docx"
-            groups.append(([s], docx_dir / slug / filename))
+            data = load_surah_json(slug, s, json_dir, warn=False)
+            groups.append(([s], docx_dir / slug / surah_docx_filename(s, data)))
 
     for surah_nums, path in groups:
         doc = Document()
@@ -995,21 +1076,12 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                     style=doc.styles[VERSE_HEADING_STYLE],
                     outline_level=1,
                 )
-                segments = item.get("tafsir_segments")
-                if segments:
-                    for line in segments:
-                        add_styled_line(doc, line, font_size, font_name, quran_font,
-                                        quran_classes, bold=bold,
-                                        line_spacing=line_spacing,
-                                        t1_color=t1_color)
-                else:
-                    for line in item.get("tafsir_text", "").split("\n"):
-                        add_paragraph(doc, line, size=font_size, font_name=font_name,
-                                      bold=bold, line_spacing=line_spacing)
-                if include_source:
-                    add_paragraph(doc, item.get("source_url", ""), size=font_size - 2,
-                                  color=(110, 110, 110), font_name=font_name,
-                                  line_spacing=line_spacing)
+                add_tafsir_body(
+                    doc, item, font_name=font_name, font_size=font_size,
+                    quran_font=quran_font, quran_classes=quran_classes,
+                    bold=bold, line_spacing=line_spacing,
+                    t1_color=t1_color, include_source=include_source,
+                )
 
         if meta is None:
             print(f"[warn] no data for {path}", file=sys.stderr)
@@ -1024,6 +1096,158 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
         print(f"[docx] {path}")
         files.append(path)
     return files
+
+
+def build_combined_docx_for_surahs(
+    slugs: List[str], surahs: List[int], json_dir: Path, docx_dir: Path,
+    label: str, font_name: str, font_size: float, include_source: bool,
+    full_quran: bool = False, quran_font: str = "Kitab",
+    quran_classes: Optional[set] = None, bold: bool = False,
+    line_spacing: float = 1.0, page_color: str = PAGE_COLOR,
+    quran_color: Tuple[int, int, int] = QURAN_COLOR,
+    t1_color: Tuple[int, int, int] = T1_RGB,
+) -> Tuple[List[Path], int]:
+    """Build DOCX where every verse is followed by each selected tafsir.
+
+    Reads only local per-surah JSON. Returns (written files, error count).
+    """
+    if Document is None:
+        raise RuntimeError("python-docx is not installed; install with: pip install python-docx")
+
+    quran_classes = quran_classes or {"qa", "qr", "t3"}
+    out_dir = docx_dir / "combined" / label
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    errors = 0
+    cache: Dict[Tuple[str, int], dict] = {}
+    for slug in slugs:
+        for s in surahs:
+            data = load_surah_json(slug, s, json_dir)
+            if data is None:
+                errors += 1
+            else:
+                cache[(slug, s)] = data
+
+    if full_quran:
+        groups: List[Tuple[List[int], Path]] = [
+            (list(surahs), out_dir / f"{label}-full.docx")
+        ]
+    else:
+        groups = []
+        for s in surahs:
+            first = next((cache[(slug, s)] for slug in slugs if (slug, s) in cache), None)
+            groups.append(([s], out_dir / surah_docx_filename(s, first)))
+
+    files: List[Path] = []
+    for surah_nums, path in groups:
+        available: Dict[int, List[Tuple[str, dict]]] = {}
+        for s in surah_nums:
+            entries = [(slug, cache[(slug, s)]) for slug in slugs if (slug, s) in cache]
+            if entries:
+                available[s] = entries
+        if not available:
+            continue
+
+        doc = Document()
+        style_document(doc, font_name, font_size, page_color)
+
+        cover_entries = next(iter(available.values()))
+        cover_data = combined_cover_data(
+            [data for _slug, data in cover_entries],
+            [slug for slug, _data in cover_entries],
+        )
+        add_cover_page(doc, cover_data, list(available), full_quran,
+                       font_name, font_size, line_spacing)
+
+        written = 0
+        for s in surah_nums:
+            entries = available.get(s)
+            if not entries:
+                continue
+            if written:
+                doc.add_page_break()
+            written += 1
+
+            first_data = entries[0][1]
+            sm = first_data.get("surah") or {}
+            add_paragraph(
+                doc,
+                f"سورة {sm.get('name_ar', s)}",
+                size=font_size + 6,
+                bold=True,
+                color=(11, 74, 49),
+                font_name=font_name,
+                line_spacing=line_spacing,
+                space_after=4,
+                style=doc.styles[SURAH_HEADING_STYLE],
+                outline_level=0,
+            )
+
+            ayahs: Dict[int, List[Tuple[str, dict, dict]]] = {}
+            for slug, data in entries:
+                for item in data.get("ayahs", []):
+                    a = item.get("ayah")
+                    if a is None:
+                        m = re.search(r":(\d+)$", str(item.get("key", "")))
+                        a = m.group(1) if m else None
+                    if a is None:
+                        continue
+                    ayahs.setdefault(int(a), []).append((slug, data, item))
+
+            for a in sorted(ayahs):
+                ayah_entries = ayahs[a]
+                first_item = ayah_entries[0][2]
+                key = first_item.get("key", f"{s}:{a}")
+                ayah_text = next(
+                    (str(it.get("ayah_text", "")) for _slug, _data, it in ayah_entries
+                     if it.get("ayah_text")),
+                    "",
+                )
+                add_paragraph(
+                    doc,
+                    f"﴿{ayah_text}﴾  [{key}]",
+                    size=font_size + 1,
+                    bold=True,
+                    color=quran_color,
+                    font_name=quran_font,
+                    line_spacing=line_spacing,
+                    space_after=2,
+                    style=doc.styles[VERSE_HEADING_STYLE],
+                    outline_level=1,
+                )
+
+                for slug, data, item in ayah_entries:
+                    add_paragraph(
+                        doc,
+                        tafsir_label(data, slug),
+                        size=font_size + 2,
+                        bold=True,
+                        color=(11, 74, 49),
+                        font_name=font_name,
+                        line_spacing=line_spacing,
+                        space_after=2,
+                        style=doc.styles[TAFSIR_HEADING_STYLE],
+                        outline_level=2,
+                    )
+                    add_tafsir_body(
+                        doc, item, font_name=font_name, font_size=font_size,
+                        quran_font=quran_font, quran_classes=quran_classes,
+                        bold=bold, line_spacing=line_spacing,
+                        t1_color=t1_color, include_source=include_source,
+                    )
+
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            doc.save(path)
+        except PermissionError:
+            print(f"[warn] cannot write {path} — close it in Microsoft Word and retry",
+                  file=sys.stderr)
+            errors += 1
+            continue
+        print(f"[docx] {path}")
+        files.append(path)
+
+    return files, errors
 
 
 # --------------------------------------------------------------------------- #
@@ -1061,6 +1285,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tafsirs", default="tabary",
                    help="comma-separated slugs, or 'all' (default: tabary)")
+    p.add_argument("--combine",
+                   help="comma-separated tafsir slugs to merge into one DOCX; "
+                        "implies --docx and reads local JSON only "
+                        "(e.g. --combine katheer,saadi)")
+    p.add_argument("--combine-name",
+                   help="output folder/file prefix for --combine "
+                        "(default: slugs joined with '-')")
     p.add_argument("--surahs", default="1",
                    help="'all', '1-3', '1,2,18' (default: 1)")
     p.add_argument("--docx", action="store_true", dest="build_only",
@@ -1121,8 +1352,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     quran_color = hex_to_rgb(args.quran_color)
     t1_color = hex_to_rgb(args.t1_color)
     full_mode = args.full or args.full_alias or args.surahs.strip().lower() in ("all", "*")
-    build_only = args.build_only
-    mode = "DOCX" if build_only else "SCRAPE"
+
+    combine_slugs = [s.strip() for s in (args.combine or "").split(",") if s.strip()]
+    if combine_slugs:
+        if len(combine_slugs) < 2:
+            print("--combine needs at least two tafsir slugs", file=sys.stderr)
+            return 2
+        build_only = True  # combining is a DOCX-only, local-JSON operation
+        slugs = combine_slugs
+        mode = "COMBINE"
+        combine_label = combined_output_label(combine_slugs, args.combine_name)
+    else:
+        build_only = args.build_only
+        slugs = []
+        mode = "DOCX" if build_only else "SCRAPE"
+        combine_label = ""
 
     # --docx must not touch the network, so use a local 1..114 range here.
     all_numbers = list(range(1, 115))
@@ -1131,24 +1375,50 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("No surahs selected", file=sys.stderr)
         return 2
 
-    if build_only:
-        if args.tafsirs.strip().lower() == "all":
-            slugs = sorted(
-                path.name for path in args.json_dir.iterdir()
-                if path.is_dir() and not path.name.startswith("~")
-            ) if args.json_dir.exists() else []
+    if not combine_slugs:
+        if build_only:
+            if args.tafsirs.strip().lower() == "all":
+                slugs = sorted(
+                    path.name for path in args.json_dir.iterdir()
+                    if path.is_dir() and not path.name.startswith("~")
+                ) if args.json_dir.exists() else []
+            else:
+                slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
+            if not slugs:
+                print("No tafsir JSON directories found for --docx", file=sys.stderr)
+                return 1
         else:
-            slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
-        if not slugs:
-            print("No tafsir JSON directories found for --docx", file=sys.stderr)
-            return 1
-    else:
-        slugs = get_all_tafsir_slugs() if args.tafsirs.strip().lower() == "all" else [
-            s.strip() for s in args.tafsirs.split(",") if s.strip()
-        ]
+            slugs = get_all_tafsir_slugs() if args.tafsirs.strip().lower() == "all" else [
+                s.strip() for s in args.tafsirs.split(",") if s.strip()
+            ]
 
     print(f"Tafsirs: {len(slugs)} | workers={args.workers} | "
           f"mode={mode} | scope={'FULL' if full_mode else f'surahs {surahs}'}")
+    if combine_slugs:
+        print(f"[combine] {' + '.join(combine_slugs)} -> "
+              f"{args.docx_dir / 'combined' / combine_label}")
+
+    if combine_slugs:
+        if full_mode:
+            available = sorted({s for slug in slugs
+                                for s in local_surah_numbers(slug, args.json_dir)})
+            surahs = available
+            print(f"[combine] full: {len(surahs)} surahs available across selected tafsirs")
+            if not surahs:
+                print("[error] no surah JSON found for --combine --full", file=sys.stderr)
+                return 1
+        combined_files, combined_errors = build_combined_docx_for_surahs(
+            slugs, surahs, args.json_dir, args.docx_dir, combine_label,
+            args.tafsir_font, args.font_size, args.include_source,
+            full_quran=full_mode, quran_font=args.quran_font,
+            quran_classes=quran_classes, bold=args.bold_tafsir,
+            line_spacing=args.line_spacing, page_color=args.page_color,
+            quran_color=quran_color, t1_color=t1_color,
+        )
+        if not combined_files:
+            print("[error] no combined DOCX was written", file=sys.stderr)
+            combined_errors += 1
+        return 1 if combined_errors else 0
 
     surah_meta: List[dict] = []
     names: Dict[str, str] = {}
