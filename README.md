@@ -407,7 +407,10 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
   one level-2 tafsir heading per selected tafsir under each verse. ✅
 - `--full` scraping uses each tafsir's sitemap, so partial tafsirs only include
   surahs they actually have. ✅
-- Text: **plain text + styled runs** (no raw HTML by default). ✅
+- Text: **plain text + styled runs** (no raw HTML by default). CSS display-block
+  spans (`bh`, `bl`, `bx`, `ba`, `bz`, `fb`, `fi`) are treated as line breaks, so
+  turath-hadir headings, bullet lines, the closing box, and footnotes stay
+  separate in JSON and DOCX; inline `fr` markers get a separating space. ✅
 - Fonts: **Word RTL throughout**; Kitab for ayah/Quran text, KFGQPC Uthman Taha
   Naskh for tafsir text. ✅
 - Typography: **16 pt tafsir, not bold, no italic, single line spacing**;

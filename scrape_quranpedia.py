@@ -98,6 +98,24 @@ LTR_TOKEN_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9@._\-/:+%,–]|[ ](?=[A-Za-z0-9]))*"
 )
 
+# QuranPedia uses inline <span> elements that are display:block in style.css.
+# Treating them as line boundaries is essential: turath-hadir puts headings,
+# bullet lines, the closing box, and the whole footnote block in such spans,
+# so a text-only walker otherwise glues them to neighbouring paragraphs.
+BLOCK_TEXT_CLASSES = frozenset({
+    "bh",  # بين يدي السورة heading
+    "bl",  # bullet/list line
+    "bx",  # closing callout box
+    "ba",  # centered ayah banner
+    "bz",  # signature line
+    "fb",  # footnote block
+    "fi",  # one footnote item
+})
+BLOCK_TAGS = frozenset({
+    "p", "div", "li", "blockquote", "ul", "ol",
+    "h1", "h2", "h3", "h4", "h5", "h6",
+})
+
 PAGE_COLOR = "F3EEE2"            # warm parchment page background
 QURAN_COLOR = (0x0F, 0x6B, 0x9C)  # #0F6B9C verse text
 T1_COLOR = "B22222"              # dark red for t1 spans (not necessarily Quran)
@@ -877,12 +895,31 @@ def tafsir_html_to_segments(div) -> List[List[dict]]:
         return []
     lines: List[List[dict]] = [[]]
 
+    def new_line() -> None:
+        if lines[-1]:
+            lines.append([])
+
     def walk(node, classes: Tuple[str, ...]) -> None:
         if isinstance(node, NavigableString):
-            text = re.sub(r"[ \t]+", " ", str(node).replace("\xa0", " "))
+            text = re.sub(r"\s+", " ", str(node).replace("\xa0", " "))
             if text:
                 lines[-1].append({"text": text, "cls": list(classes)})
             return
+
+        own_classes = set(node.get("class", []) or []) if getattr(node, "get", None) else set()
+        is_block = bool(own_classes & BLOCK_TEXT_CLASSES) or (
+            getattr(node, "name", "") in BLOCK_TAGS
+        )
+        if is_block:
+            new_line()
+
+        # .fr footnote markers are separated from the preceding word by CSS
+        # padding, not by a literal space in the HTML.
+        if "fr" in own_classes and lines[-1]:
+            prev = lines[-1][-1]["text"]
+            if prev and not prev.endswith((" ", "\xa0")):
+                lines[-1][-1]["text"] = prev + " "
+
         for child in node.children:
             if getattr(child, "name", None) == "br":
                 lines.append([])
@@ -890,6 +927,9 @@ def tafsir_html_to_segments(div) -> List[List[dict]]:
                 walk(child, classes + tuple(child.get("class", [])))
             else:
                 walk(child, classes)
+
+        if is_block:
+            new_line()
 
     walk(div, ())
 
