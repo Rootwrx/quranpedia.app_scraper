@@ -393,6 +393,13 @@ def build_catalog(source: str, names: Dict[str, str], *,
     coverage_other = add_category(
         COVERAGE_OTHER_SLUG, COVERAGE_OTHER_NAME, "coverage", aliases=["unknown"])
 
+    # Stable site filter order decides which facet becomes canonical when a book
+    # is listed under more than one method or coverage.
+    method_order = {cat["slug"]: idx for idx, cat in enumerate(method_cats.values())}
+    method_order[method_other["slug"]] = len(method_order)
+    coverage_order = {cat["slug"]: idx for idx, cat in enumerate(coverage_cats.values())}
+    coverage_order[coverage_other["slug"]] = len(coverage_order)
+
     container = soup.select_one("section.well") or soup
     headings = container.select("h2.era-h")
     for heading in headings:
@@ -509,12 +516,35 @@ def build_catalog(source: str, names: Dict[str, str], *,
                 "coverage": cat_ref(coverage_other),
             }
         facets = entry["facets"]
-        for kind in ("method", "coverage"):
-            ref = facets.get(kind) or cat_ref(
-                method_other if kind == "method" else coverage_other)
+
+        def ordered_facet_refs(kind: str, card_key: str, order: dict,
+                               fallback: dict) -> List[dict]:
+            """All facet values for this book, in the site's filter order."""
+            slugs = [
+                card[card_key] for card in entry.get("cards", [])
+                if card.get(card_key) and (kind, card[card_key]) in category_by_key
+            ]
+            ref = facets.get(kind) or fallback
+            if ref.get("slug") and (kind, ref["slug"]) in category_by_key:
+                slugs.append(ref["slug"])
+            unique = sorted(set(slugs), key=lambda s: (order.get(s, len(order)), s))
+            refs = [cat_ref(category_by_key[(kind, s)]) for s in unique]
+            return refs or [dict(ref)]
+
+        methods = ordered_facet_refs(
+            "method", "method_category", method_order, cat_ref(method_other))
+        coverages = ordered_facet_refs(
+            "coverage", "coverage_category", coverage_order, cat_ref(coverage_other))
+        entry["methods"] = methods
+        entry["coverages"] = coverages
+
+        for kind, refs, fallback in (
+            ("method", methods, cat_ref(method_other)),
+            ("coverage", coverages, cat_ref(coverage_other)),
+        ):
+            ref = refs[0] if refs else fallback
             facets[kind] = ref
-            add_to_entry(entry, add_category(
-                ref["slug"], ref["name"], kind))
+            add_to_entry(entry, add_category(ref["slug"], ref["name"], kind))
         entry["path_categories"] = [
             dict(entry["category"]), dict(facets["method"]), dict(facets["coverage"])]
 
@@ -775,6 +805,11 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
     meta = dict(tafsir_meta)
     display = clean_label(catalog_entry.get("display_name") or tafsir_meta.get("display_name") or slug)
     surah_numbers = sorted({s for s, _a in ayah_urls})
+    facets = catalog_entry.get("facets") or tafsir_meta.get("facets") or {}
+    methods = (catalog_entry.get("methods") or tafsir_meta.get("methods")
+               or ([facets["method"]] if facets.get("method") else []))
+    coverages = (catalog_entry.get("coverages") or tafsir_meta.get("coverages")
+                 or ([facets["coverage"]] if facets.get("coverage") else []))
     meta.update({
         "slug": slug,
         "display_name": display,
@@ -783,8 +818,10 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
         "author": clean_label(catalog_entry.get("author") or tafsir_meta.get("author") or ""),
         "category": catalog_entry.get("category") or tafsir_meta.get("category") or {},
         "categories": catalog_entry.get("categories") or tafsir_meta.get("categories") or [],
-        "facets": catalog_entry.get("facets") or tafsir_meta.get("facets") or {},
+        "facets": facets,
         "path_categories": catalog_entry.get("path_categories") or [],
+        "methods": methods,
+        "coverages": coverages,
         "catalog_entry": catalog_entry,
         "source": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
         "source_index": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
@@ -844,6 +881,10 @@ def get_book_meta(slug: str, names: Dict[str, str],
         "author": catalog_entry.get("author", ""),
         "category": catalog_entry.get("category", {}),
         "categories": catalog_entry.get("categories", []),
+        "facets": catalog_entry.get("facets", {}),
+        "path_categories": catalog_entry.get("path_categories", []),
+        "methods": catalog_entry.get("methods", []),
+        "coverages": catalog_entry.get("coverages", []),
         "source": f"{BASE}/{path}/{slug}/index.html",
     }
     try:

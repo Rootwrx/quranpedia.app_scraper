@@ -66,6 +66,12 @@ shelf and card marks remain extra selectable categories. Declared and observed
 book counts are stored for every category. Books with no explicit methodology
 use `غير محدد المنهج`.
 
+A book listed under more than one method or coverage is stored once under a
+canonical path. The catalog and each book's `meta.json` keep the complete lists
+in `methods` and `coverages`, while `facets.method` / `facets.coverage` and
+`path_categories` hold the canonical values used for the folder. The canonical
+facet follows the site's filter order, not the order cards appear in the page.
+
 Output paths are:
 
 ```
