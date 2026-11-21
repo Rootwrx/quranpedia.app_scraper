@@ -7,6 +7,7 @@ ayah. Example: https://quranpedia.app/tafseer/tabary/sura1-aya1.html
 Usage examples
 --------------
   # scrape 7 ayahs of Al-Faatiha from tafsir tabary -> per-surah JSON only
+  # (tafsir output is category-first with Arabic folder names)
   python scrape_quranpedia.py --tafsirs tabary --surahs 1
 
   # build DOCX only (no network/scraping) from already-downloaded JSON
@@ -15,6 +16,10 @@ Usage examples
   # full mode works for both: scrape all surahs, or build all DOCX files
   python scrape_quranpedia.py --tafsirs tabary --full
   python scrape_quranpedia.py --tafsirs tabary --full --docx
+
+  # select every tafsir in a site category (Arabic name or era slug)
+  python scrape_quranpedia.py --category المتقدمون --full
+  python scrape_quranpedia.py --category era-2 --full --docx
 
   # combine tafsirs from local JSON: each verse, then its tafsir from each book
   python scrape_quranpedia.py --combine katheer,saadi --surahs 2
@@ -62,6 +67,7 @@ QURAN_DATA_JS = f"{BASE}/assets/quran-data.js"
 TAFSEER_INDEX = f"{BASE}/tafseer/index.html"
 ULOOM_INDEX = f"{BASE}/uloom/index.html"
 SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
+DEFAULT_CATEGORY_NAME = "غير مصنف"
 
 # These uloom books are word/root dictionaries: their sitemaps list /w/*.html
 # entries, not suraN-ayaM.html pages. Their sura*.html URLs exist but are just
@@ -128,6 +134,429 @@ def fetch_text(url: str, **kwargs) -> str:
 
 
 # --------------------------------------------------------------------------- #
+# Category catalog / Arabic folder layout
+# --------------------------------------------------------------------------- #
+def clean_label(value: object) -> str:
+    return re.sub(r"\s+", " ", str(value or "").replace("\xa0", " ")).strip()
+
+
+def safe_component(value: str, max_len: int = 100) -> str:
+    text = re.sub(r'[\\/:*?"<>|]+', "", clean_label(value))
+    text = re.sub(r"\.+$", "", text).strip()
+    if len(text) > max_len:
+        text = text[: max_len].rstrip() + "…"
+    return text or DEFAULT_CATEGORY_NAME
+
+
+def tag_slug(label: str) -> str:
+    suffix = re.sub(r"[^\w\u0600-\u06FF]+", "-", clean_label(label),
+                    flags=re.UNICODE).strip("-")
+    return "tag-" + (suffix or "misc")
+
+
+def json_read(path: Path) -> Optional[dict]:
+    """Read a JSON object without raising on missing/corrupt files."""
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def json_write(path: Path, data: dict) -> None:
+    """Atomically write JSON, raising OSError on failure."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+    tmp.replace(path)
+
+
+def build_display_names(books: Dict[str, dict]) -> Dict[str, str]:
+    """Stable Arabic folder/file names; duplicate titles get the author."""
+    base: Dict[str, str] = {}
+    by_title: Dict[str, List[str]] = {}
+    for slug, entry in sorted(books.items()):
+        title = clean_label(entry.get("display_name") or entry.get("title")) or f"تفسير {slug}"
+        base[slug] = title
+        by_title.setdefault(title, []).append(slug)
+
+    for title, slugs in by_title.items():
+        if len(slugs) < 2:
+            continue
+        for slug in slugs:
+            author = clean_label(books[slug].get("author"))
+            if author:
+                base[slug] = f"{title} — {author}"
+
+    grouped: Dict[str, List[str]] = {}
+    for slug, label in base.items():
+        grouped.setdefault(safe_component(label), []).append(slug)
+
+    result: Dict[str, str] = {}
+    for label, slugs in grouped.items():
+        for index, slug in enumerate(sorted(slugs), start=1):
+            result[slug] = label if index == 1 else f"{label} ({index})"
+    return result
+
+
+def build_catalog(source: str, names: Dict[str, str], *,
+                  index_html: Optional[str] = None,
+                  retries: int = 3, timeout: int = 30,
+                  delay: float = 0.0) -> dict:
+    """Build a local category catalog for the requested source.
+
+    Tafsir categories come from the five era sections on /tafseer/index.html.
+    The overlapping "الأكثر قراءة" shelf and card marks are kept as extra
+    selectable categories, but the era section is the primary folder.
+    """
+    if source != "tafseer":
+        return {"source": source, "source_index": ULOOM_INDEX,
+                "categories": [], "books": {},
+                "note": "category catalog not implemented for this source yet"}
+
+    html = index_html if index_html is not None else fetch_text(
+        TAFSEER_INDEX, retries=retries, timeout=timeout, delay=delay)
+    soup = BeautifulSoup(html, "lxml")
+    categories: List[dict] = []
+    books: Dict[str, dict] = {}
+    category_by_slug: Dict[str, dict] = {}
+
+    def add_category(slug: str, name: str, kind: str,
+                     declared: Optional[int] = None) -> dict:
+        cat = category_by_slug.get(slug)
+        if cat is None:
+            cat = {"slug": slug, "name": name, "kind": kind,
+                   "declared_count": declared, "observed_book_count": 0}
+            category_by_slug[slug] = cat
+            categories.append(cat)
+        elif declared is not None and cat.get("declared_count") is None:
+            cat["declared_count"] = declared
+        return cat
+
+    def ensure_book(slug: str) -> dict:
+        entry = books.get(slug)
+        if entry is None:
+            display = names.get(slug, slug)
+            entry = {
+                "slug": slug,
+                "display_name": display,
+                "name": display,
+                "title": display,
+                "author": "",
+                "death_hijri": "",
+                "category": {"slug": "", "name": DEFAULT_CATEGORY_NAME, "kind": "era"},
+                "categories": [],
+                "cards": [],
+                "source": f"{BASE}/tafseer/{slug}/index.html",
+            }
+            books[slug] = entry
+        return entry
+
+    container = soup.select_one("section.well") or soup
+    headings = container.select("h2.era-h")
+    for index, heading in enumerate(headings):
+        slug = clean_label(heading.get("id") or "")
+        small = heading.find("small")
+        name = clean_label(heading.get_text(" ", strip=True))
+        if small:
+            small_text = clean_label(small.get_text(" ", strip=True))
+            if small_text:
+                name = clean_label(name.replace(small_text, "", 1))
+        declared = None
+        if small:
+            nums = re.findall(r"\d+", small.get_text(" ", strip=True))
+            if nums:
+                declared = int(nums[-1])  # the final number is the book count
+        if not slug or not name:
+            continue
+        cat = add_category(slug, name, "era", declared)
+
+        cards = []
+        node = heading.find_next_sibling()
+        while node is not None and not (
+            getattr(node, "name", None) == "h2"
+            and "era-h" in (node.get("class") or [])
+        ):
+            if getattr(node, "name", None) == "ul":
+                cards.extend(node.select("a.tcard[href]"))
+            elif getattr(node, "name", None) == "a" and "tcard" in (node.get("class") or []):
+                cards.append(node)
+            node = node.find_next_sibling()
+
+        cat["observed_book_count"] = len(cards)
+        cat_entry = {"slug": cat["slug"], "name": cat["name"], "kind": cat["kind"]}
+
+        for card in cards:
+            href = str(card.get("href") or "")
+            match = re.search(r"\./([a-z0-9-]+)/index\.html", href)
+            if not match:
+                continue
+            book_slug = match.group(1)
+            entry = ensure_book(book_slug)
+            title_el = card.select_one(".tc-hd b")
+            full_el = card.select_one("i")
+            author_el = card.select_one("small")
+            year_el = card.select_one(".yr")
+            if title_el:
+                label = clean_label(title_el.get_text(" ", strip=True))
+                if label:
+                    entry["display_name"] = label
+                    entry["name"] = label
+            if full_el:
+                entry["title"] = clean_label(full_el.get_text(" ", strip=True)) or entry["title"]
+            if author_el:
+                author_text = clean_label(author_el.get_text(" ", strip=True))
+                author_text = re.sub(
+                    r"\(\s*\d+\s*-\s*\d+\s*هـ\s*\)|\(\s*ت\s*\d+\s*هـ\s*\)",
+                    "", author_text).strip()
+                if author_text:
+                    entry["author"] = author_text
+            if year_el:
+                nums = re.search(r"\d+", year_el.get_text(" ", strip=True))
+                if nums:
+                    entry["death_hijri"] = nums.group(0)
+
+            if slug != "era-top" and not entry["category"].get("slug"):
+                entry["category"] = dict(cat_entry)
+            if not any(c["slug"] == cat["slug"] for c in entry["categories"]):
+                entry["categories"].append(dict(cat_entry))
+            entry["cards"].append({
+                "category_slug": cat["slug"],
+                "url": f"{BASE}/tafseer/{book_slug}/index.html",
+                "label": clean_label(title_el.get_text(" ", strip=True)) if title_el else "",
+                "shelf": "popular" if slug == "era-top" else "era",
+            })
+
+            for mark in card.select(".tc-tg .mark"):
+                label = clean_label(mark.get_text(" ", strip=True))
+                if not label:
+                    continue
+                tcat = add_category(tag_slug(label), label, "tag")
+                tentry = {"slug": tcat["slug"], "name": tcat["name"], "kind": tcat["kind"]}
+                if not any(c["slug"] == tentry["slug"] for c in entry["categories"]):
+                    entry["categories"].append(tentry)
+
+    for slug, label in sorted(names.items()):
+        ensure_book(slug)
+
+    for entry in books.values():
+        if not entry["category"].get("slug"):
+            fallback = add_category("uncategorized", DEFAULT_CATEGORY_NAME, "era")
+            entry["category"] = {"slug": fallback["slug"], "name": fallback["name"],
+                                 "kind": fallback["kind"]}
+            if not any(c["slug"] == fallback["slug"] for c in entry["categories"]):
+                entry["categories"].append(dict(entry["category"]))
+
+    display_names = build_display_names(books)
+    for slug, display in display_names.items():
+        books[slug]["display_name"] = display
+
+    for cat in categories:
+        cat["observed_book_count"] = sum(
+            1 for entry in books.values()
+            if any(c.get("slug") == cat["slug"] for c in entry.get("categories", []))
+        )
+
+    return {
+        "source": source,
+        "source_index": TAFSEER_INDEX,
+        "sitemap_index": SITEMAP_INDEX,
+        "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "total_books": len(books),
+        "total_categories": len(categories),
+        "categories": categories,
+        "display_names": display_names,
+        "books": dict(sorted(books.items())),
+    }
+
+
+def catalog_path(args: argparse.Namespace, source: str) -> Path:
+    custom = getattr(args, "catalog_file", None)
+    if custom is not None:
+        return Path(custom)
+    return Path(args.json_dir) / f"catalog-{source}.json"
+
+
+def save_catalog(path: Path, catalog: dict) -> None:
+    json_write(path, catalog)
+
+
+def load_local_catalog(path: Path) -> dict:
+    data = json_read(path)
+    return data if data and data.get("books") else {}
+
+
+def catalog_slugs(catalog: dict, values: Iterable[str]) -> set:
+    wanted = {clean_label(value).lower() for value in values if clean_label(value)}
+    result = set()
+    for cat in catalog.get("categories", []):
+        if (clean_label(cat.get("slug", "")).lower() in wanted
+                or clean_label(cat.get("name", "")).lower() in wanted):
+            result.add(cat["slug"])
+    return result
+
+
+def slugs_from_categories(catalog: dict, values: Iterable[str]) -> List[str]:
+    wanted = catalog_slugs(catalog, values)
+    return sorted(
+        slug for slug, entry in catalog.get("books", {}).items()
+        if any(cat.get("slug") in wanted for cat in entry.get("categories", []))
+    )
+
+
+def uses_arabic_layout(catalog: dict, source: str) -> bool:
+    return source == "tafseer" and bool(catalog.get("books"))
+
+
+def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
+               catalog: dict, *, prefer_legacy: bool = False) -> Tuple[Path, Path]:
+    """Return (json book dir, docx book dir) for a slug.
+
+    New tafsir layout:
+        <json_root>/tafseer/<Arabic era category>/<Arabic tafsir name>/
+        <docx_root>/tafseer/<Arabic era category>/<Arabic tafsir name>/
+    Legacy layout:
+        <json_root>/<slug>/ and <docx_root>/<slug>/
+    """
+    legacy_json = json_root / slug
+    legacy_docx = docx_root / slug
+    if not uses_arabic_layout(catalog, source):
+        return legacy_json, legacy_docx
+
+    entry = catalog.get("books", {}).get(slug, {})
+    category = clean_label((entry.get("category") or {}).get("name")) or DEFAULT_CATEGORY_NAME
+    display = clean_label(entry.get("display_name") or slug) or slug
+    relative = Path(SOURCE_PATHS[source]) / safe_component(category) / safe_component(display)
+    new_json = json_root / relative
+    new_docx = docx_root / relative
+    if prefer_legacy:
+        if legacy_json.exists():
+            return legacy_json, legacy_docx
+        if legacy_docx.exists() and not new_json.exists():
+            return legacy_json, legacy_docx
+    return new_json, new_docx
+
+
+def find_local_book_dir(json_dir: Path, source: str, slug: str, catalog: dict) -> Path:
+    """Locate a book's JSON dir in new or legacy layout, without network."""
+    preferred, _ = book_paths(json_dir, json_dir, source, slug, catalog)
+    legacy = json_dir / slug
+
+    def has_data(path: Path) -> bool:
+        return (path / "meta.json").exists() or any(path.glob("sura*.json"))
+
+    if uses_arabic_layout(catalog, source):
+        if has_data(preferred):
+            return preferred
+        if has_data(legacy):
+            return legacy
+        source_root = json_dir / SOURCE_PATHS[source]
+        if source_root.exists():
+            for meta_path in sorted(source_root.glob("*/*/meta.json")):
+                data = json_read(meta_path)
+                if data and str(data.get("slug", "")) == slug:
+                    return meta_path.parent
+        return preferred
+    return legacy
+
+
+def resolve_book_paths(json_dir: Path, docx_dir: Path, source: str, slug: str,
+                       catalog: dict, *, migrate: bool = False) -> Tuple[Path, Path]:
+    """Return resolved (json dir, docx dir), optionally migrating legacy output."""
+    new_json, new_docx = book_paths(json_dir, docx_dir, source, slug, catalog)
+    legacy_json = json_dir / slug
+    legacy_docx = docx_dir / slug
+    if not uses_arabic_layout(catalog, source):
+        return legacy_json, legacy_docx
+
+    existing = find_local_book_dir(json_dir, source, slug, catalog)
+    if migrate and existing == legacy_json and legacy_json.exists() and not new_json.exists():
+        try:
+            new_json.parent.mkdir(parents=True, exist_ok=True)
+            legacy_json.rename(new_json)
+            print(f"[move] {slug}: {legacy_json} -> {new_json}")
+            existing = new_json
+        except OSError as exc:
+            print(f"[warn] {slug}: cannot move {legacy_json}: {exc}", file=sys.stderr)
+    if migrate and legacy_docx.exists() and not new_docx.exists():
+        try:
+            new_docx.parent.mkdir(parents=True, exist_ok=True)
+            legacy_docx.rename(new_docx)
+            print(f"[move] {slug}: {legacy_docx} -> {new_docx}")
+        except OSError as exc:
+            print(f"[warn] {slug}: cannot move {legacy_docx}: {exc}", file=sys.stderr)
+
+    if existing != new_json:
+        return existing, legacy_docx
+    return new_json, new_docx
+
+
+def discover_local_slugs(json_dir: Path, source: str) -> List[str]:
+    """Find slugs with local surah JSON, including new Arabic layout."""
+    slugs = set()
+    source_root = json_dir / SOURCE_PATHS[source]
+    if source_root.exists():
+        for meta_path in sorted(source_root.glob("*/*/meta.json")):
+            data = json_read(meta_path)
+            if data and data.get("slug"):
+                slugs.add(str(data["slug"]))
+        if not slugs:
+            for path in sorted(source_root.glob("*/*/sura*.json")):
+                match = re.match(r"sura(\d{3})\.json$", path.name)
+                if match:
+                    slugs.add(path.parent.name)
+    if json_dir.exists():
+        for path in json_dir.iterdir():
+            if (not path.is_dir() or path.name in SOURCE_PATHS.values()
+                    or path.name.startswith("~")):
+                continue
+            if any(path.glob("sura*.json")) or (path / "meta.json").exists():
+                slugs.add(path.name)
+    return sorted(slugs)
+
+
+def full_json_name(slug: str, catalog: dict, source: str) -> str:
+    return "full.json" if uses_arabic_layout(catalog, source) else f"{slug}-full.json"
+
+
+def full_docx_name(slug: str, catalog: dict, source: str) -> str:
+    if not uses_arabic_layout(catalog, source):
+        return f"{slug}-full.docx"
+    entry = catalog.get("books", {}).get(slug, {})
+    display = clean_label(entry.get("display_name") or slug) or slug
+    return f"{safe_component(display)}-full.docx"
+
+
+def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
+                    ayah_urls: Dict[Tuple[int, int], str], source: str, slug: str) -> Path:
+    """Write book-level metadata first so every folder is self-describing."""
+    meta = dict(tafsir_meta)
+    display = clean_label(catalog_entry.get("display_name") or tafsir_meta.get("display_name") or slug)
+    surah_numbers = sorted({s for s, _a in ayah_urls})
+    meta.update({
+        "slug": slug,
+        "display_name": display,
+        "name": display,
+        "title": clean_label(catalog_entry.get("title") or tafsir_meta.get("book") or "") or meta.get("book", ""),
+        "author": clean_label(catalog_entry.get("author") or tafsir_meta.get("author") or ""),
+        "category": catalog_entry.get("category") or tafsir_meta.get("category") or {},
+        "categories": catalog_entry.get("categories") or tafsir_meta.get("categories") or [],
+        "catalog_entry": catalog_entry,
+        "source": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
+        "source_index": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
+        "sitemap": f"{BASE}/sitemap-{slug}.xml",
+        "surah_count": len(surah_numbers),
+        "surah_numbers": surah_numbers,
+        "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    })
+    death = clean_label(catalog_entry.get("death_hijri") or "")
+    if death.isdigit():
+        meta["death_hijri"] = int(death)
+    json_write(path, meta)
+    return path
+
+
+# --------------------------------------------------------------------------- #
 # Site metadata
 # --------------------------------------------------------------------------- #
 def load_quran_data() -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
@@ -158,14 +587,19 @@ def get_all_tafsir_slugs() -> List[str]:
 
 
 def get_book_meta(slug: str, names: Dict[str, str],
-                  source: str = "tafseer") -> dict:
+                  source: str = "tafseer",
+                  catalog_entry: Optional[dict] = None) -> dict:
     """Read book metadata from a tafseer/uloom index page JSON-LD block."""
     path = SOURCE_PATHS[source]
+    catalog_entry = catalog_entry or {}
     meta = {
         "slug": slug,
-        "name": names.get(slug, slug),
-        "book": "",
-        "author": "",
+        "name": catalog_entry.get("display_name") or names.get(slug, slug),
+        "display_name": catalog_entry.get("display_name") or names.get(slug, slug),
+        "book": catalog_entry.get("title", ""),
+        "author": catalog_entry.get("author", ""),
+        "category": catalog_entry.get("category", {}),
+        "categories": catalog_entry.get("categories", []),
         "source": f"{BASE}/{path}/{slug}/index.html",
     }
     try:
@@ -175,11 +609,15 @@ def get_book_meta(slug: str, names: Dict[str, str],
         )
         if match:
             ld = json.loads(match.group(1))
-            meta["book"] = ld.get("name", "")
-            meta["name"] = ld.get("alternateName") or meta["name"]
-            meta["author"] = (ld.get("author") or {}).get("name", "")
+            if ld.get("name"):
+                meta["book"] = ld["name"]
+            if ld.get("alternateName"):
+                meta["name"] = ld["alternateName"]
+            ld_author = (ld.get("author") or {}).get("name", "")
+            if ld_author:
+                meta["author"] = ld_author
         death = re.search(r"\((\d+)\s*-\s*(\d+)\s*هـ\)|ت\s*(\d+)\s*هـ", html)
-        if death:
+        if death and not catalog_entry.get("death_hijri"):
             meta["death_hijri"] = int(death.group(2) or death.group(3) or 0)
     except Exception:  # noqa: BLE001 - metadata is best-effort
         pass
@@ -282,9 +720,9 @@ def parse_ayah_page(html: str, slug: str, surah: int, ayah: int, url: str,
 def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
                  tafsir_meta: dict, surah_meta: dict, out_dir: Path, args,
                  source: str = "tafseer") -> Path:
-    """Scrape one surah into <json_dir>/<slug>/suraNNN.json."""
-    (out_dir / slug).mkdir(parents=True, exist_ok=True)
-    out_path = out_dir / slug / f"sura{surah:03d}.json"
+    """Scrape one surah into the resolved book directory as suraNNN.json."""
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out_path = out_dir / f"sura{surah:03d}.json"
     if out_path.exists() and not args.force:
         print(f"[skip] {slug} surah {surah}: {out_path} exists")
         return out_path
@@ -335,29 +773,37 @@ def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
     return out_path
 
 
-def write_full_json(slug: str, json_dir: Path) -> Optional[Path]:
-    """Stream <slug>-full.json from every per-surah file on disk.
+def write_full_json(slug: str, book_dir: Path, *,
+                    filename: Optional[str] = None) -> Optional[Path]:
+    """Stream a full-book JSON from every per-surah file in book_dir.
 
-    Only created in --full mode. It reflects all surahs currently scraped for
-    the tafsir, so it works for partial tafsirs too. Streaming avoids holding
-    a whole tafsir (potentially gigabytes) in memory.
+    It reflects all surahs currently scraped for the tafsir, so partial
+    tafsirs work too. Streaming avoids holding a whole tafsir in memory.
     """
     existing = []
-    for path in (json_dir / slug).glob("sura*.json"):
+    for path in book_dir.glob("sura*.json"):
         m = re.match(r"sura(\d{3})\.json$", path.name)
         if m:
             existing.append((int(m.group(1)), path))
     existing.sort()
     if not existing:
         return None
-    out = json_dir / slug / f"{slug}-full.json"
+    out = book_dir / (filename or f"{slug}-full.json")
     tmp = out.with_suffix(".json.tmp")
     first = json.loads(existing[0][1].read_text(encoding="utf-8"))
+    meta = dict(first.get("tafsir", {"slug": slug}))
     with tmp.open("w", encoding="utf-8") as fh:
-        fh.write('{\n  "tafsir": ')
-        fh.write(json.dumps(first.get("tafsir", {"slug": slug}), ensure_ascii=False))
+        fh.write('{\n  "full": true,\n  "tafsir": ')
+        fh.write(json.dumps(meta, ensure_ascii=False))
+        fh.write(',\n  "display_name": ')
+        fh.write(json.dumps(meta.get("display_name") or meta.get("name") or slug,
+                            ensure_ascii=False))
         fh.write(',\n  "source_index": ')
         fh.write(json.dumps(first.get("source_index", ""), ensure_ascii=False))
+        fh.write(',\n  "source_url": ')
+        fh.write(json.dumps(first.get("source_url", ""), ensure_ascii=False))
+        fh.write(',\n  "included_surahs": ')
+        fh.write(json.dumps([s for s, _path in existing]))
         fh.write(f',\n  "surah_count": {len(existing)},')
         fh.write(f'\n  "scraped_at": {json.dumps(time.strftime("%Y-%m-%dT%H:%M:%S%z"))},')
         fh.write('\n  "surahs": [\n')
@@ -786,9 +1232,10 @@ def add_styled_line(doc, segments: List[dict], size: float, tafsir_font: str,
 
 
 def load_surah_json(slug: str, surah: int, json_dir: Path, *,
+                    book_dir: Optional[Path] = None,
                     warn: bool = True) -> Optional[dict]:
     """Load one per-surah JSON file without touching the network."""
-    path = json_dir / slug / f"sura{surah:03d}.json"
+    path = (book_dir or (json_dir / slug)) / f"sura{surah:03d}.json"
     if not path.exists():
         if warn:
             print(f"[error] missing JSON {path}", file=sys.stderr)
@@ -1028,20 +1475,25 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                           quran_classes: Optional[set] = None, bold: bool = False,
                           line_spacing: float = 1.0, page_color: str = PAGE_COLOR,
                           quran_color: Tuple[int, int, int] = QURAN_COLOR,
-                          t1_color: Tuple[int, int, int] = T1_RGB) -> List[Path]:
+                          t1_color: Tuple[int, int, int] = T1_RGB,
+                          book_json_dir: Optional[Path] = None,
+                          book_docx_dir: Optional[Path] = None,
+                          full_filename: Optional[str] = None) -> List[Path]:
     if Document is None:
         raise RuntimeError("python-docx is not installed; install with: pip install python-docx")
 
+    json_book = book_json_dir or (json_dir / slug)
+    docx_book = book_docx_dir or (docx_dir / slug)
     files = []
     groups: List[Tuple[List[int], Path]] = []
     quran_classes = quran_classes or {"qa", "qr", "t3"}
-    docx_dir.mkdir(parents=True, exist_ok=True)
+    docx_book.mkdir(parents=True, exist_ok=True)
     if full_quran:
-        groups.append((surahs, docx_dir / slug / f"{slug}-full.docx"))
+        groups.append((surahs, docx_book / (full_filename or f"{slug}-full.docx")))
     else:
         for s in surahs:
-            data = load_surah_json(slug, s, json_dir, warn=False)
-            groups.append(([s], docx_dir / slug / surah_docx_filename(s, data)))
+            data = load_surah_json(slug, s, json_dir, book_dir=json_book, warn=False)
+            groups.append(([s], docx_book / surah_docx_filename(s, data)))
 
     for surah_nums, path in groups:
         doc = Document()
@@ -1050,7 +1502,7 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
 
         cover_data = None
         for s in surah_nums:
-            cover_path = json_dir / slug / f"sura{s:03d}.json"
+            cover_path = json_book / f"sura{s:03d}.json"
             if cover_path.exists():
                 try:
                     cover_data = json.loads(cover_path.read_text(encoding="utf-8"))
@@ -1062,9 +1514,9 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                            font_name, font_size, line_spacing)
 
         for idx, s in enumerate(surah_nums):
-            json_path = json_dir / slug / f"sura{s:03d}.json"
+            json_path = json_book / f"sura{s:03d}.json"
             if not json_path.exists():
-                print(f"[warn] missing JSON {json_path}", file=sys.stderr)
+                print(f"[error] missing JSON {json_path}", file=sys.stderr)
                 continue
             if idx > 0:
                 doc.add_page_break()
@@ -1115,13 +1567,13 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                 )
 
         if meta is None:
-            print(f"[warn] no data for {path}", file=sys.stderr)
+            print(f"[error] no data for {path}", file=sys.stderr)
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             doc.save(path)
-        except PermissionError:
-            print(f"[warn] cannot write {path} — close it in Microsoft Word and retry",
+        except OSError as exc:
+            print(f"[error] cannot write {path}: {exc} — close it in Microsoft Word and retry",
                   file=sys.stderr)
             continue
         print(f"[docx] {path}")
@@ -1137,6 +1589,8 @@ def build_combined_docx_for_surahs(
     line_spacing: float = 1.0, page_color: str = PAGE_COLOR,
     quran_color: Tuple[int, int, int] = QURAN_COLOR,
     t1_color: Tuple[int, int, int] = T1_RGB,
+    catalog: Optional[dict] = None,
+    source: str = "tafseer",
 ) -> Tuple[List[Path], int]:
     """Build DOCX where every verse is followed by each selected tafsir.
 
@@ -1151,9 +1605,13 @@ def build_combined_docx_for_surahs(
 
     errors = 0
     cache: Dict[Tuple[str, int], dict] = {}
+    book_dirs = {
+        slug: find_local_book_dir(json_dir, source, slug, catalog or {})
+        for slug in slugs
+    }
     for slug in slugs:
         for s in surahs:
-            data = load_surah_json(slug, s, json_dir)
+            data = load_surah_json(slug, s, json_dir, book_dir=book_dirs.get(slug))
             if data is None:
                 errors += 1
             else:
@@ -1270,8 +1728,8 @@ def build_combined_docx_for_surahs(
         path.parent.mkdir(parents=True, exist_ok=True)
         try:
             doc.save(path)
-        except PermissionError:
-            print(f"[warn] cannot write {path} — close it in Microsoft Word and retry",
+        except OSError as exc:
+            print(f"[error] cannot write {path}: {exc} — close it in Microsoft Word and retry",
                   file=sys.stderr)
             errors += 1
             continue
@@ -1301,10 +1759,11 @@ def parse_surahs(spec: str, all_numbers: List[int]) -> List[int]:
     return [n for n in all_numbers if n in result]
 
 
-def local_surah_numbers(slug: str, json_dir: Path) -> List[int]:
+def local_surah_numbers(slug: str, json_dir: Path, *,
+                        book_dir: Optional[Path] = None) -> List[int]:
     """Surahs available on disk for a tafsir (used by --docx; no network)."""
     found = []
-    for path in (json_dir / slug).glob("sura*.json"):
+    for path in (book_dir or (json_dir / slug)).glob("sura*.json"):
         m = re.match(r"sura(\d{3})\.json$", path.name)
         if m:
             found.append(int(m.group(1)))
@@ -1316,6 +1775,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--tafsirs", default="tabary",
                    help="comma-separated tafsir/book slugs, or 'all' (default: tabary)")
+    p.add_argument("--all", action="store_true",
+                   help="select every book in the selected source (alias for --tafsirs all)")
+    p.add_argument("--category", dest="categories", action="append", default=[],
+                   help="select tafsirs by Arabic category name, era slug, or tag "
+                        "(repeatable; tafsirs only)")
     p.add_argument("--source", choices=sorted(SOURCE_PATHS), default="tafseer",
                    help="book index to use: tafseer (default) or uloom")
     p.add_argument("--uloom", action="store_const", dest="source", const="uloom",
@@ -1336,8 +1800,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-docx", action="store_true",
                    help=argparse.SUPPRESS)  # default is scrape-only now
     p.add_argument("--full", action="store_true",
-                   help="full mode for either operation: scrape every sitemap surah "
-                        "or build DOCX from every surah JSON on disk (incl. <slug>-full.docx)")
+                   help="scrape every sitemap surah / build DOCX from every surah JSON "
+                        "on disk (also writes full.json and one complete DOCX)")
     p.add_argument("--full-quran-docx", action="store_true", dest="full_alias",
                    help=argparse.SUPPRESS)  # backwards-compatible alias
     p.add_argument("--max-ayahs", type=int, default=0,
@@ -1353,9 +1817,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-html", action="store_true",
                    help="also store raw tafsir HTML in JSON")
     p.add_argument("--no-full-json", action="store_true",
-                   help="do not write <slug>-full.json in --full scrape mode")
+                   help="do not write full.json (<slug>-full.json in legacy layout) "
+                        "in --full scrape mode")
     p.add_argument("--json-dir", type=Path, default=Path("data/json"))
     p.add_argument("--docx-dir", type=Path, default=Path("data/docx"))
+    p.add_argument("--catalog-file", type=Path, default=None,
+                   help="category catalog path (default: <json-dir>/catalog-<source>.json)")
     p.add_argument("--tafsir-font", default="KFGQPC Uthman Taha Naskh",
                    help="font for tafsir text (default: KFGQPC Uthman Taha Naskh)")
     p.add_argument("--font", dest="tafsir_font", help=argparse.SUPPRESS)  # backwards-compatible alias
@@ -1382,12 +1849,17 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-source", action="store_true",
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
+
     source = args.source
     args.styled = not args.no_styled
     quran_classes = {c.strip() for c in args.quran_classes.split(",") if c.strip()}
     quran_color = hex_to_rgb(args.quran_color)
     t1_color = hex_to_rgb(args.t1_color)
-    full_mode = args.full or args.full_alias or args.surahs.strip().lower() in ("all", "*")
+    surah_spec = (args.surahs or "1").strip()
+    full_mode = bool(args.full or args.full_alias
+                     or surah_spec.lower() in ("all", "*"))
+    if args.all:
+        args.tafsirs = "all"
 
     combine_slugs = [s.strip() for s in (args.combine or "").split(",") if s.strip()]
     if combine_slugs:
@@ -1406,56 +1878,86 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # --docx must not touch the network, so use a local 1..114 range here.
     all_numbers = list(range(1, 115))
-    surahs = parse_surahs(args.surahs, all_numbers)
+    surahs = parse_surahs(surah_spec, all_numbers)
     if not surahs and not full_mode:
         print("No surahs selected", file=sys.stderr)
         return 2
 
-    if not combine_slugs:
-        wants_all = args.tafsirs.strip().lower() in ("all", "*")
-        if build_only:
-            if wants_all:
-                slugs = sorted(
-                    path.name for path in args.json_dir.iterdir()
-                    if path.is_dir() and not path.name.startswith("~")
-                ) if args.json_dir.exists() else []
-                if source == "uloom":
-                    skipped = [s for s in slugs if s in ULOOM_WORD_SLUGS]
-                    if skipped:
-                        print(f"[warn] skipping {len(skipped)} unsupported word-based "
-                              f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
-                        slugs = [s for s in slugs if s not in ULOOM_WORD_SLUGS]
-            else:
-                slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
-            if not slugs:
-                print("No tafsir JSON directories found for --docx", file=sys.stderr)
-                return 1
-        else:
-            if wants_all:
-                all_slugs = get_all_slugs(source)
-                if source == "uloom":
-                    skipped = [s for s in all_slugs if s in ULOOM_WORD_SLUGS]
-                    if skipped:
-                        print(f"[warn] skipping {len(skipped)} unsupported word-based "
-                              f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
-                    slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS]
-                else:
-                    slugs = all_slugs
-            else:
-                slugs = [s.strip() for s in args.tafsirs.split(",") if s.strip()]
+    cat_path = catalog_path(args, source)
+    catalog: dict = {}
+    names: Dict[str, str] = {}
+    surah_meta: List[dict] = []
 
-        if source == "uloom" and not wants_all:
+    if source == "tafseer":
+        if build_only:
+            catalog = load_local_catalog(cat_path)
+            if not catalog:
+                print(f"[warn] no local tafsir catalog at {cat_path}; "
+                      f"using legacy <slug> folders", file=sys.stderr)
+        else:
+            surah_meta, names, _short = load_quran_data()
+            catalog = build_catalog(
+                source, names, retries=args.retries, timeout=args.timeout,
+                delay=args.delay)
+            try:
+                save_catalog(cat_path, catalog)
+            except OSError as exc:
+                print(f"[warn] cannot save catalog {cat_path}: {exc}", file=sys.stderr)
+    elif not build_only:
+        surah_meta, names, _short = load_quran_data()
+
+    if args.categories and source != "tafseer":
+        print("[error] --category is currently available for tafsirs only", file=sys.stderr)
+        return 2
+
+    if not combine_slugs:
+        explicit = [s.strip() for s in (args.tafsirs or "").split(",") if s.strip()]
+        wants_all = args.all or any(v.strip().lower() in ("all", "*") for v in explicit)
+        if args.categories:
+            if not catalog:
+                print(f"[error] no local category catalog at {cat_path}; "
+                      f"scrape once before using --category with --docx", file=sys.stderr)
+                return 1
+            slugs = slugs_from_categories(catalog, args.categories)
+            slugs.extend(s for s in explicit if s not in slugs)
+        elif wants_all:
+            if build_only:
+                slugs = discover_local_slugs(args.json_dir, source)
+                if catalog:
+                    slugs = [s for s in slugs
+                             if local_surah_numbers(
+                                 s, args.json_dir,
+                                 book_dir=find_local_book_dir(
+                                     args.json_dir, source, s, catalog))]
+            else:
+                all_slugs = get_all_slugs(source)
+                slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS] \
+                    if source == "uloom" else all_slugs
+            if source == "uloom" and slugs:
+                skipped = [s for s in slugs if s in ULOOM_WORD_SLUGS]
+                if skipped:
+                    print(f"[warn] skipping {len(skipped)} unsupported word-based "
+                          f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
+        else:
+            slugs = explicit
+
+        if source == "uloom":
             bad = [s for s in slugs if s in ULOOM_WORD_SLUGS]
             if bad:
                 print(f"[error] {', '.join(bad)}: word-based uloom book(s) are not "
                       f"supported by --source uloom; they need a word-entry scraper",
                       file=sys.stderr)
                 return 1
+        if not slugs:
+            print("[error] no tafsirs matched the selection", file=sys.stderr)
+            return 1
 
     label = "Books" if source == "uloom" else "Tafsirs"
     source_label = "local" if combine_slugs else source
     print(f"{label}: {len(slugs)} | source={source_label} | workers={args.workers} | "
           f"mode={mode} | scope={'FULL' if full_mode else f'surahs {surahs}'}")
+    if args.categories:
+        print(f"[category] {', '.join(args.categories)}")
     if combine_slugs:
         print(f"[combine] {' + '.join(combine_slugs)} -> "
               f"{args.docx_dir / 'combined' / combine_label}")
@@ -1463,7 +1965,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     if combine_slugs:
         if full_mode:
             available = sorted({s for slug in slugs
-                                for s in local_surah_numbers(slug, args.json_dir)})
+                                for s in local_surah_numbers(
+                                    slug, args.json_dir,
+                                    book_dir=find_local_book_dir(
+                                        args.json_dir, source, slug, catalog))})
             surahs = available
             print(f"[combine] full: {len(surahs)} surahs available across selected tafsirs")
             if not surahs:
@@ -1476,37 +1981,40 @@ def main(argv: Optional[List[str]] = None) -> int:
             quran_classes=quran_classes, bold=args.bold_tafsir,
             line_spacing=args.line_spacing, page_color=args.page_color,
             quran_color=quran_color, t1_color=t1_color,
+            catalog=catalog, source=source,
         )
         if not combined_files:
             print("[error] no combined DOCX was written", file=sys.stderr)
             combined_errors += 1
         return 1 if combined_errors else 0
 
-    surah_meta: List[dict] = []
-    names: Dict[str, str] = {}
-    if not build_only:
-        surah_meta, names, _short = load_quran_data()
-
     any_error = False
     for slug in slugs:
+        json_root = args.json_dir
+        json_book, docx_book = resolve_book_paths(
+            args.json_dir, args.docx_dir, source, slug, catalog,
+            migrate=not build_only)
+        catalog_entry = catalog.get("books", {}).get(slug, {})
+
         if build_only:
-            available = local_surah_numbers(slug, args.json_dir)
+            available = local_surah_numbers(slug, json_root, book_dir=json_book)
             surahs_for_slug = available if full_mode else surahs
             if full_mode:
                 print(f"[full] {slug}: {len(available)} surah JSON files on disk")
                 if not available:
-                    print(f"[error] {slug}: no surah JSON found in {args.json_dir / slug}",
+                    print(f"[error] {slug}: no surah JSON found in {json_book}",
                           file=sys.stderr)
                     any_error = True
                     continue
 
             built = build_docx_for_surahs(
-                slug, surahs_for_slug, args.json_dir, args.docx_dir,
+                slug, surahs_for_slug, json_root, args.docx_dir,
                 args.tafsir_font, args.font_size, args.include_source,
                 quran_font=args.quran_font, quran_classes=quran_classes,
                 bold=args.bold_tafsir, line_spacing=args.line_spacing,
                 page_color=args.page_color, quran_color=quran_color,
-                t1_color=t1_color,
+                t1_color=t1_color, book_json_dir=json_book,
+                book_docx_dir=docx_book,
             )
             if len(built) != len(surahs_for_slug):
                 print(f"[error] {slug}: built {len(built)}/{len(surahs_for_slug)} "
@@ -1515,32 +2023,52 @@ def main(argv: Optional[List[str]] = None) -> int:
                 any_error = True
             if full_mode:
                 full_built = build_docx_for_surahs(
-                    slug, available, args.json_dir, args.docx_dir,
+                    slug, available, json_root, args.docx_dir,
                     font_name=args.tafsir_font, font_size=args.font_size,
                     include_source=args.include_source, full_quran=True,
                     quran_font=args.quran_font, quran_classes=quran_classes,
                     bold=args.bold_tafsir, line_spacing=args.line_spacing,
                     page_color=args.page_color, quran_color=quran_color,
-                    t1_color=t1_color,
+                    t1_color=t1_color, book_json_dir=json_book,
+                    book_docx_dir=docx_book,
+                    full_filename=full_docx_name(slug, catalog, source),
                 )
                 if not full_built:
-                    print(f"[error] {slug}: could not build {slug}-full.docx",
-                          file=sys.stderr)
+                    print(f"[error] {slug}: could not build "
+                          f"{full_docx_name(slug, catalog, source)}", file=sys.stderr)
                     any_error = True
             continue
 
-        tafsir_meta = get_book_meta(slug, names, source)
+        tafsir_meta = get_book_meta(slug, names, source, catalog_entry)
         urls = get_ayah_urls(slug)
         surahs_for_slug = sorted({s for (s, _a) in urls}) if full_mode else surahs
         if full_mode:
             print(f"[full] {slug}: {len(surahs_for_slug)} surahs available in sitemap")
 
+        try:
+            write_book_meta(json_book / "meta.json", tafsir_meta, catalog_entry,
+                            urls, source, slug)
+        except OSError as exc:
+            print(f"[error] {slug}: cannot write metadata: {exc}", file=sys.stderr)
+            any_error = True
+            continue
+
         for s in surahs_for_slug:
             sm = next((x for x in surah_meta if x["number"] == s), {"number": s})
-            scrape_surah(slug, s, urls, tafsir_meta, sm, args.json_dir, args,
+            scrape_surah(slug, s, urls, tafsir_meta, sm, json_book, args,
                          source=source)
         if full_mode and not args.no_full_json:
-            write_full_json(slug, args.json_dir)
+            try:
+                full_path = write_full_json(
+                    slug, json_book, filename=full_json_name(slug, catalog, source))
+            except OSError as exc:
+                print(f"[error] {slug}: cannot write full JSON: {exc}", file=sys.stderr)
+                any_error = True
+            else:
+                if full_path is None:
+                    print(f"[error] {slug}: no surah JSON available for full output",
+                          file=sys.stderr)
+                    any_error = True
     return 1 if any_error else 0
 
 

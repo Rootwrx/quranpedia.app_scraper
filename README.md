@@ -44,10 +44,44 @@ index. The 78 uloom books split into two groups:
   warning for `--tafsirs all` and rejected with `[error]` if named explicitly.
   They need a separate word-entry scraper/output format.
 
-Uloom slugs do not collide with tafsir slugs, so output directories remain
-separate (`data/json/<slug>/`, `data/docx/<slug>/`). You can also point
-`--json-dir`/`--docx-dir` at separate roots, and `--combine` accepts any mix of
-local tafsir and uloom JSON slugs.
+Uloom slugs do not collide with tafsir slugs. Uloom still uses the legacy
+`data/json/<slug>/` and `data/docx/<slug>/` layout; tafsirs now use Arabic
+category folders (below). You can also point `--json-dir`/`--docx-dir` at
+separate roots, and `--combine` accepts any mix of local tafsir and uloom JSON
+slugs.
+
+## Tafsir category structure
+
+Tafsirs are now organized like the books library. The scraper reads the five
+era sections on the [tafsir index](https://quranpedia.app/tafseer/index.html)
+and saves a local catalog at `data/json/catalog-tafseer.json`. The primary
+category is the era; the overlapping “الأكثر قراءة” shelf and card marks are
+kept as extra selectable categories. Declared and observed book counts are both
+stored.
+
+The catalog maps each slug to a stable Arabic `display_name` (duplicate titles
+get the author, then a numeric suffix). Output paths are:
+
+```
+data/json/tafseer/<Arabic era category>/<Arabic tafsir name>/meta.json
+data/json/tafseer/<Arabic era category>/<Arabic tafsir name>/suraNNN.json
+data/json/tafseer/<Arabic era category>/<Arabic tafsir name>/full.json
+data/docx/tafseer/<Arabic era category>/<Arabic tafsir name>/<Arabic tafsir name>-full.docx
+```
+
+Examples:
+
+```
+data/json/tafseer/المتقدمون/تفسير الطبري/
+data/json/tafseer/المتأخرون والمعاصرون/التراث الحاضر في التفسير المعاصر/
+data/docx/tafseer/المتقدمون/تفسير الطبري/
+```
+
+`--category` accepts an Arabic category name, an era slug (`era-1` … `era-4`,
+`era-top`), or a tag label, and can be repeated. `--all` selects every tafsir.
+Legacy `data/json/<slug>/` and `data/docx/<slug>/` folders are detected and
+moved into the new layout automatically on the next scrape; `--docx` can still
+read them if no catalog is present.
 
 ## Books library support
 
@@ -146,33 +180,44 @@ Three explicit operations:
 scrape and DOCX operations. `--combine` is local-only and accepts slugs from
 either source.
 
+Tafsir selection supports `--tafsirs slug1,slug2`, `--all`, and repeatable
+`--category` values (Arabic category name, era slug, or tag label). `--source`
+still selects tafseer vs. uloom; `--category` is tafsir-only.
+
 All three operations support the same two scopes:
 
 - per surah via `--surahs 1`, `--surahs 1-3`, etc.
 - full via `--full` (or `--surahs all`):
-  - scrape mode: every surah in that tafsir's sitemap, plus `<slug>-full.json`
-  - DOCX mode: every surah with JSON on disk, plus `<slug>-full.docx`
+  - scrape mode: every surah in that tafsir's sitemap, plus `full.json`
+  - DOCX mode: every surah with JSON on disk, plus `<Arabic tafsir name>-full.docx`
   - combine mode: the union of surahs available across the selected tafsirs,
     plus `<label>-full.docx`
 
 Scrape details:
 
-1. Writes **per-surah JSON** at `data/json/<slug>/suraNNN.json` (canonical, resumable).
-2. `--full` additionally writes `data/json/<slug>/<slug>-full.json`, streamed from
-   every surah JSON on disk for that tafsir (partial tafsirs work too).
-3. Stores **both plain text and styled segments**:
+1. Writes **book metadata first** to `meta.json` (catalog entry, category,
+   source URLs, sitemap URL, and surah list/count).
+2. Writes **per-surah JSON** under the Arabic category/name folder
+   (`data/json/tafseer/<category>/<name>/suraNNN.json` for tafsirs; legacy
+   `data/json/<slug>/suraNNN.json` for uloom). Canonical and resumable.
+3. `--full` additionally writes `full.json` (or `<slug>-full.json` in legacy
+   layout), streamed from every surah JSON on disk for that tafsir (partial
+   tafsirs work too).
+4. Stores **both plain text and styled segments**:
    - `tafsir_text`: clean text with line breaks
    - `tafsir_segments`: per-line `{text, cls}` runs, so DOCX can style `t1`
      quoted text (dark red), quoted Quran (`qa/qr` → dark green), references
      (`t2/nw` → small gray), and parenthetical citations (`t3/t4` → dark green)
      without storing raw HTML. No italic is ever emitted.
-4. Resumable: existing surah JSON files are skipped unless `--force` is used.
+5. Resumable: existing surah JSON files are skipped unless `--force` is used.
 
 DOCX details:
 
-- one per surah: `data/docx/<slug>/NNN سورة <اسم السورة>.docx`
-  (e.g. `001 سورة الفاتحة.docx`) — no English surah name in headings or filenames
-- one full-tafsir volume with `--full`: `<slug>-full.docx`
+- one per surah: `data/docx/tafseer/<Arabic category>/<Arabic name>/NNN سورة <اسم السورة>.docx`
+  for tafsirs (legacy `data/docx/<slug>/NNN سورة <اسم السورة>.docx` for uloom),
+  e.g. `001 سورة الفاتحة.docx` — no English surah name in headings or filenames
+- one full-tafsir volume with `--full`: `<Arabic tafsir name>-full.docx`
+  (`<slug>-full.docx` in legacy layout)
 - combined volumes with `--combine katheer,saadi`:
   `data/docx/combined/katheer-saadi/NNN سورة <اسم السورة>.docx`, or
   `data/docx/combined/katheer-saadi/katheer-saadi-full.docx` with `--full`.
@@ -246,7 +291,7 @@ JSON shape (per surah):
 ```
 
 `--include-html` additionally stores the raw `div.tafsir` HTML in `tafsir_html`.
-`--no-styled` omits `tafsir_segments`; `--no-full-json` skips the `<slug>-full.json`
+`--no-styled` omits `tafsir_segments`; `--no-full-json` skips the `full.json`
 file that `--full` would otherwise write.
 
 ## Usage
@@ -263,6 +308,11 @@ python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx
 # same two scopes for surahs 1-3 across two tafsirs
 python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3
 python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3 --docx
+
+# category-based selection (Arabic name or era slug); --category is repeatable
+python scrape_quranpedia.py --category المتقدمون --full
+python scrape_quranpedia.py --category era-4 --full --docx
+python scrape_quranpedia.py --all --full --docx
 
 # full mode: scrape everything, then build everything separately
 python scrape_quranpedia.py --tafsirs katheer --full --workers 8
@@ -293,14 +343,18 @@ python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx \
 
 ## Tested sample
 
-`data/json/tabary/sura001.json`, `data/docx/tabary/001 سورة الفاتحة.docx`,
-and `data/docx/tabary/tabary-full.docx` were generated and verified: Word RTL
-flags present at document/section/paragraph/run levels, Arabic text and line
-breaks preserved, styled runs present, plain text exactly matches the segments,
-font mapping is correct (Kitab for ayah/Quran, KFGQPC Uthman Taha Naskh for
-tafsir), typography is 16 pt non-bold non-italic with single line spacing,
-page color is `#F3EEE2`, ayah verses are `#0F6B9C`, verse paragraphs carry Word
-outline level 1 for collapsing, and `t1` spans are `#B22222`.
+`data/json/tafseer/المتقدمون/تفسير الطبري/{meta.json,sura001.json}` and
+`data/docx/tafseer/المتقدمون/تفسير الطبري/001 سورة الفاتحة.docx` were generated
+and verified: Word RTL flags present at document/section/paragraph/run levels,
+Arabic text and line breaks preserved, styled runs present, plain text exactly
+matches the segments, font mapping is correct (Kitab for ayah/Quran, KFGQPC
+Uthman Taha Naskh for tafsir), typography is 16 pt non-bold non-italic with
+single line spacing, page color is `#F3EEE2`, ayah verses are `#0F6B9C`, verse
+paragraphs carry Word outline level 1 for collapsing, and `t1` spans are
+`#B22222`. The partial tafsir `turath-hadir` was verified in full mode under
+`المتأخرون والمعاصرون`, producing `full.json`, per-surah DOCX files, and
+`التراث الحاضر في التفسير المعاصر-full.docx`. Legacy folder migration and
+`--combine` with the new paths were verified too.
 `data/docx/combined/katheer-saadi/002 سورة البقرة.docx` and
 `data/docx/combined/tabary-turath-hadir/tabary-turath-hadir-full.docx` were also
 verified: each verse is followed by one outline-level-2 heading per tafsir, with
@@ -314,9 +368,14 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
 
 - Modes: default = scrape only; `--docx` = build DOCX only, no network. ✅
 - Both modes support per-surah (`--surahs`) and full (`--full`) scopes. ✅
-- JSON: per-surah files; `--full` additionally writes `<slug>-full.json`. ✅
-- DOCX: per-surah files plus `<slug>-full.docx` with `--full`; no combined range.
+- JSON: `meta.json` first, then per-surah files; `--full` additionally writes
+  `full.json`. Tafsirs use Arabic category/name folders; uloom remains slug-first
+  until its category pass. ✅
+- DOCX: per-surah files plus `<Arabic tafsir name>-full.docx` with `--full`.
   Arabic-only surah names, plus a metadata cover page. ✅
+- Tafsir categories: five era sections from the site index, with the popular
+  shelf and card marks available as extra `--category` filters. Legacy folders
+  are migrated on the next scrape. ✅
 - `--combine` merges selected tafsirs locally into verse-first DOCX files, with
   one level-2 tafsir heading per selected tafsir under each verse. ✅
 - `--full` scraping uses each tafsir's sitemap, so partial tafsirs only include
@@ -330,7 +389,7 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
   named `NNN سورة <الاسم>.docx`. ✅
 - Uloom: 69 ayah-based books reuse the current scraper via `--source uloom`;
   the 9 word/root dictionaries are explicitly unsupported by this pipeline. ✅
-- Tafsir scope: waiting for your shortlist of slugs.
+  Uloom category/Arabic folders are the next step after tafsir layout review.
 
 ## Still open (optional)
 
