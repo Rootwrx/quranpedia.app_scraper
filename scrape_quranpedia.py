@@ -67,6 +67,7 @@ try:
     from docx.oxml import OxmlElement
     from docx.oxml.ns import qn
     from docx.shared import Cm, Pt, RGBColor
+    from docx.text.paragraph import Paragraph
 except ImportError:  # DOCX support is optional at scrape time
     Document = None
 
@@ -98,6 +99,7 @@ USER_AGENT = "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)"
 LTR_TOKEN_RE = re.compile(
     r"[A-Za-z0-9](?:[A-Za-z0-9@._\-/:+%,–]|[ ](?=[A-Za-z0-9]))*"
 )
+_RUN_SPECIAL_RE = re.compile(r"[\t\r\n]")
 
 # QuranPedia uses inline <span> elements that are display:block in style.css.
 # Treating them as line boundaries is essential: turath-hadir puts headings,
@@ -1522,32 +1524,147 @@ def _rpr_template(*, rtl: bool, font_name: Optional[str], size: float,
     return template
 
 
-def add_text_run(p, text: str, *, rtl: bool, font_name: Optional[str],
-                 size: float, bold: bool, color: Optional[Tuple[int, int, int]]) -> None:
-    run = p.add_run(text)
-    run._r.insert(0, deepcopy(_rpr_template(
+def _append_run_text(r, text: str) -> None:
+    if not text:
+        return
+    t = OxmlElement("w:t")
+    t.text = text
+    if len(text.strip()) < len(text):
+        t.set(qn("xml:space"), "preserve")
+    r.append(t)
+
+
+def _append_run_children(r, text: str) -> None:
+    """Mirror python-docx's run.text setter without its schema scans."""
+    pos = 0
+    for match in _RUN_SPECIAL_RE.finditer(text):
+        if match.start() > pos:
+            _append_run_text(r, text[pos:match.start()])
+        r.append(OxmlElement("w:tab" if match.group(0) == "\t" else "w:br"))
+        pos = match.end()
+    if pos < len(text):
+        _append_run_text(r, text[pos:])
+
+
+def _append_text_run(p_el, text: str, *, rtl: bool, font_name: Optional[str],
+                     size: float, bold: bool,
+                     color: Optional[Tuple[int, int, int]]) -> None:
+    r = OxmlElement("w:r")
+    r.append(deepcopy(_rpr_template(
         rtl=rtl, font_name=font_name, size=size, bold=bold, color=color,
     )))
+    _append_run_children(r, text)
+    p_el.append(r)
+
+
+def add_text_run(p, text: str, *, rtl: bool, font_name: Optional[str],
+                 size: float, bold: bool,
+                 color: Optional[Tuple[int, int, int]]) -> None:
+    """Backward-compatible single-run helper."""
+    _append_text_run(p._p, text, rtl=rtl, font_name=font_name,
+                     size=size, bold=bold, color=color)
+
+
+def _append_text_runs(p_el, text: str, *, font_name: Optional[str] = None,
+                      size: float = 0, bold: bool = False,
+                      color: Optional[Tuple[int, int, int]] = None) -> None:
+    """Add mixed Arabic/Latin text with Word-correct per-run direction."""
+    pos = 0
+    for match in LTR_TOKEN_RE.finditer(text):
+        if match.start() > pos:
+            _append_text_run(p_el, text[pos:match.start()], rtl=True,
+                             font_name=font_name, size=size, bold=bold,
+                             color=color)
+        _append_text_run(p_el, match.group(0), rtl=False,
+                         font_name=font_name, size=size, bold=bold,
+                         color=color)
+        pos = match.end()
+    if pos < len(text):
+        _append_text_run(p_el, text[pos:], rtl=True,
+                         font_name=font_name, size=size, bold=bold,
+                         color=color)
 
 
 def add_text_runs(p, text: str, *, font_name: Optional[str] = None,
                   size: float = 0, bold: bool = False,
                   color: Optional[Tuple[int, int, int]] = None) -> None:
     """Add mixed Arabic/Latin text with Word-correct per-run direction."""
-    pos = 0
-    for match in LTR_TOKEN_RE.finditer(text):
-        if match.start() > pos:
-            add_text_run(p, text[pos:match.start()], rtl=True,
-                         font_name=font_name, size=size, bold=bold,
-                         color=color)
-        add_text_run(p, match.group(0), rtl=False,
-                     font_name=font_name, size=size, bold=bold,
-                     color=color)
-        pos = match.end()
-    if pos < len(text):
-        add_text_run(p, text[pos:], rtl=True,
-                     font_name=font_name, size=size, bold=bold,
-                     color=color)
+    _append_text_runs(p._p, text, font_name=font_name, size=size,
+                      bold=bold, color=color)
+
+
+# The same paragraph properties are repeated for hundreds of thousands of
+# tafsir lines. Build each distinct <w:pPr> once with python-docx and clone it,
+# so the expensive schema-ordered setters run only once per style combination.
+_PPR_CACHE: Dict[tuple, object] = {}
+_PPR_TEMPLATE_DOC = None
+_PPR_TEMPLATE_PARA = None
+
+
+def _ppr_template(*, line_spacing: float, space_after: float,
+                  jc: str, style_id: Optional[str],
+                  outline_level: Optional[int]):
+    global _PPR_TEMPLATE_DOC, _PPR_TEMPLATE_PARA
+    key = (line_spacing, space_after, jc, style_id, outline_level)
+    cached = _PPR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if _PPR_TEMPLATE_DOC is None:
+        _PPR_TEMPLATE_DOC = Document()
+        _PPR_TEMPLATE_PARA = _PPR_TEMPLATE_DOC.add_paragraph()
+    p = _PPR_TEMPLATE_PARA
+    ppr = p._p.get_or_add_pPr()
+    if style_id:
+        pstyle = OxmlElement("w:pStyle")
+        pstyle.set(qn("w:val"), style_id)
+        ppr.insert(0, pstyle)
+    p.paragraph_format.line_spacing = line_spacing
+    p.paragraph_format.space_before = Pt(0)
+    p.paragraph_format.space_after = Pt(space_after)
+    apply_rtl_ppr(ppr, jc)
+    if outline_level is not None:
+        set_outline_level_in_ppr(ppr, outline_level)
+
+    template = deepcopy(ppr)
+    # Reset the shared template paragraph to a clean <w:p/> for the next key.
+    p._p.remove(ppr)
+    _PPR_CACHE[key] = template
+    return template
+
+
+def _style_id(style) -> Optional[str]:
+    if style is None:
+        return None
+    return getattr(style, "style_id", None) or str(style)
+
+
+_BLOCK_SECTPR_CACHE: Dict[object, object] = {}
+_BLOCK_SECTPR_MISSING = object()
+
+
+def _append_block(container, block) -> None:
+    """Append a block element like python-docx does, respecting w:sectPr."""
+    parent = container._body._element if hasattr(container, "_body") else container._element
+    sectpr = _BLOCK_SECTPR_CACHE.get(parent, _BLOCK_SECTPR_MISSING)
+    if sectpr is _BLOCK_SECTPR_MISSING:
+        sectpr = parent.find(qn("w:sectPr"))
+        _BLOCK_SECTPR_CACHE[parent] = sectpr
+    if sectpr is not None:
+        sectpr.addprevious(block)
+    else:
+        parent.append(block)
+
+
+def _new_paragraph(container, ppr) -> object:
+    p = OxmlElement("w:p")
+    p.append(deepcopy(ppr))
+    _append_block(container, p)
+    return p
+
+
+def _paragraph_parent(container):
+    return container._body if hasattr(container, "_body") else container
 
 
 def add_paragraph(container, text: str, *, size: float = 0, bold: bool = False,
@@ -1556,18 +1673,13 @@ def add_paragraph(container, text: str, *, size: float = 0, bold: bool = False,
                   line_spacing: float = 1.0, space_after: float = 0.0,
                   jc: str = "start", style=None,
                   outline_level: Optional[int] = None):
-    p = container.add_paragraph()
-    if style is not None:
-        p.style = style
-    p.paragraph_format.line_spacing = line_spacing
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(space_after)
-    set_rtl_paragraph(p, jc)
-    if outline_level is not None:
-        set_paragraph_outline(p, outline_level)
-    add_text_runs(p, text, font_name=font_name, size=size,
-                  bold=bold, color=color)
-    return p
+    p = _new_paragraph(container, _ppr_template(
+        line_spacing=line_spacing, space_after=space_after, jc=jc,
+        style_id=_style_id(style), outline_level=outline_level,
+    ))
+    _append_text_runs(p, text, font_name=font_name, size=size,
+                      bold=bold, color=color)
+    return Paragraph(p, _paragraph_parent(container))
 
 
 def add_styled_line(doc, segments: List[dict], size: float, tafsir_font: str,
@@ -1575,11 +1687,10 @@ def add_styled_line(doc, segments: List[dict], size: float, tafsir_font: str,
                     line_spacing: float = 1.0,
                     t1_color: Tuple[int, int, int] = T1_RGB) -> None:
     """Add one Word-compatible RTL tafsir line with correct fonts/styles."""
-    p = doc.add_paragraph()
-    p.paragraph_format.line_spacing = line_spacing
-    p.paragraph_format.space_before = Pt(0)
-    p.paragraph_format.space_after = Pt(0)
-    set_rtl_paragraph(p)
+    p = _new_paragraph(doc, _ppr_template(
+        line_spacing=line_spacing, space_after=0, jc="start",
+        style_id=None, outline_level=None,
+    ))
     for seg in segments:
         text = seg.get("text", "")
         if not text:
@@ -1597,8 +1708,8 @@ def add_styled_line(doc, segments: List[dict], size: float, tafsir_font: str,
             seg_size = max(size - 1, 6)
         elif classes & {"t3", "t4"}:
             color = (11, 74, 49)  # parenthetical citation
-        add_text_runs(p, text, font_name=font_name, size=seg_size,
-                      bold=bold, color=color)
+        _append_text_runs(p, text, font_name=font_name, size=seg_size,
+                          bold=bold, color=color)
 
 
 def load_surah_json(slug: str, surah: int, json_dir: Path, *,
