@@ -229,8 +229,10 @@ Three explicit operations:
   reads the sitemap, downloads ayah pages concurrently with one shared pool per
   book (keep-alive connections, live progress/ETA), and writes JSON.
 - **`--docx`: build DOCX only.** No network calls at all; builds purely from
-  per-surah JSON already on disk. (`--no-json` is a hidden alias.) Missing JSON
-  or a locked output file produces an `[error]` and a non-zero exit code.
+  per-surah JSON already on disk. (`--no-json` is a hidden alias.) Plain `--docx`
+  writes per-surah DOCX files; `--docx --full` writes only the complete
+  `<book>-full.docx` volume. Missing JSON or a locked output file produces an
+  `[error]` and a non-zero exit code.
 - **`--combine katheer,saadi`: build combined DOCX.** Implies `--docx`; reads
   only local JSON. Output is structured as each verse followed by that verse's
   tafsir from every selected tafsir, in the order given.
@@ -239,11 +241,12 @@ Three explicit operations:
 scrape and DOCX operations. `--combine` is local-only and accepts slugs from
 either source.
 
-Selection supports `--books slug1,slug2`, `--all`, repeatable `--category`
-values, and the `--coverage` facet filter for both sources. `--method` is
-tafsir-only. `--source` (or `--uloom`) selects the index: tafseer or uloom.
-`--tafsirs` is still accepted as a legacy alias for `--books`; prefer `--books`
-in new commands because it works for both sources.
+Selection supports `--books slug1,slug2`, the repeatable singular alias
+`--book slug1 --book slug2`, `--all`, repeatable `--category` values, and the
+`--coverage` facet filter for both sources. `--method` is tafsir-only.
+`--source` (or `--uloom`) selects the index: tafseer or uloom. `--tafsirs` is
+still accepted as a legacy alias for `--books`; prefer `--books`/`--book` in
+new commands because they work for both sources.
 
 Scraping defaults to 12 workers. All surahs for a book share one fetch queue,
 so every worker stays busy even when a surah is small. Repeat runs can add
@@ -377,6 +380,8 @@ python scrape_quranpedia.py --books tabary --surahs 1
 
 # build DOCX only from the JSON already downloaded (no network)
 python scrape_quranpedia.py --books tabary --surahs 1 --docx
+# singular --book is equivalent; without --full it builds per-surah DOCX files
+python scrape_quranpedia.py --book tabary --docx
 
 # same two scopes for surahs 1-3 across two tafsirs
 python scrape_quranpedia.py --books tabary,moyassar --surahs 1-3
@@ -389,9 +394,9 @@ python scrape_quranpedia.py --method athar --coverage full --surahs 1
 python scrape_quranpedia.py --method lugha --coverage partial --full --docx
 python scrape_quranpedia.py --all --full --docx
 
-# full mode: scrape everything, then build everything separately
-python scrape_quranpedia.py --books katheer --full
-python scrape_quranpedia.py --books katheer --full --docx
+# full mode: scrape everything; --docx then builds only one complete volume
+python scrape_quranpedia.py --book katheer --full
+python scrape_quranpedia.py --book katheer --full --docx
 
 # repeat/full runs: reuse the saved catalog and every worker across all surahs
 python scrape_quranpedia.py --books tabary --full --workers 12 --use-local-catalog
@@ -437,8 +442,9 @@ Uthman Taha Naskh for tafsir), typography is 16 pt non-bold non-italic with
 single line spacing, page color is `#F3EEE2`, ayah verses are `#0F6B9C`, verse
 paragraphs carry Word outline level 1 for collapsing, and `t1` spans are
 `#B22222`. The partial tafsir `turath-hadir` was verified in full mode under
-`المتأخرون والمعاصرون/غير محدد المنهج/سور وآيات منه`, producing `full.json`,
-per-surah DOCX files, and `التراث الحاضر في التفسير المعاصر-full.docx`. Older
+`المتأخرون والمعاصرون/غير محدد المنهج/سور وآيات منه`, producing `full.json`
+and `التراث الحاضر في التفسير المعاصر-full.docx`; per-surah DOCX files come
+from plain `--docx`. Older
 Arabic folder migration, legacy slug migration, and `--combine` with the nested
 paths were verified too.
 `data/docx/combined/katheer-saadi/002 سورة البقرة.docx` and
@@ -457,8 +463,9 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
 - JSON: `meta.json` first, then per-surah files; `--full` additionally writes
   `full.json`. Tafsirs use nested Arabic era/method/coverage folders; uloom uses
   nested Arabic field/coverage folders. Legacy slug folders are migrated. ✅
-- DOCX: per-surah files plus `<Arabic tafsir name>-full.docx` with `--full`.
-  Arabic-only surah names, plus a metadata cover page. ✅
+- DOCX: plain `--docx` writes per-surah files; `--full --docx` writes only
+  `<Arabic tafsir name>-full.docx`. Arabic-only surah names, plus a metadata
+  cover page. ✅
 - Tafsir categories: five era sections, المنهج and التغطية facets from the
   filter selects/card attributes, plus the popular shelf and card marks as
   extra `--category` filters. Uloom categories: group buttons, `data-g`, and

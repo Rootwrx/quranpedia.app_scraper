@@ -6,17 +6,18 @@ ayah. Example: https://quranpedia.app/tafseer/tabary/sura1-aya1.html
 
 Usage examples
 --------------
-  # --books selects slugs for whichever source is active
+  # --books (or singular --book) selects slugs for whichever source is active
   # scrape 7 ayahs of Al-Faatiha from tafsir tabary -> per-surah JSON only
   # (tafsir output is category-first with Arabic folder names)
   python scrape_quranpedia.py --books tabary --surahs 1
 
   # build DOCX only (no network/scraping) from already-downloaded JSON
-  python scrape_quranpedia.py --books tabary --surahs 1 --docx
+  # plain --docx writes per-surah DOCX files
+  python scrape_quranpedia.py --book tabary --docx
 
-  # full mode works for both: scrape all surahs, or build all DOCX files
-  python scrape_quranpedia.py --books tabary --full
-  python scrape_quranpedia.py --books tabary --full --docx
+  # scrape all surahs; --full --docx builds only one complete volume
+  python scrape_quranpedia.py --book tabary --full
+  python scrape_quranpedia.py --book tabary --full --docx
 
   # select tafsirs by nested category: era / method / coverage
   python scrape_quranpedia.py --category المتقدمون --surahs 1
@@ -40,7 +41,7 @@ Usage examples
   # everything, 12 workers (reuse the saved catalog on repeat runs)
   python scrape_quranpedia.py --books all --full --workers 12 --use-local-catalog
 
-  --tafsirs is still accepted as a legacy alias for --books.
+  --book is a repeatable alias for --books; --tafsirs is a legacy alias.
 
 Dependencies: requests, beautifulsoup4, lxml, python-docx
 """
@@ -3310,6 +3311,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--books", default=None,
                    help="comma-separated book slugs for the selected source, or 'all' "
                         "(default: tabary for tafsirs; use --uloom --books <slug> for uloom)")
+    p.add_argument("--book", dest="single_book", action="append", default=[],
+                   help="singular alias for --books; repeat for multiple slugs")
     p.add_argument("--tafsirs", dest="legacy_tafsirs", default=None,
                    help=argparse.SUPPRESS)  # legacy alias for --books
     p.add_argument("--all", action="store_true",
@@ -3349,8 +3352,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--no-docx", action="store_true",
                    help=argparse.SUPPRESS)  # default is scrape-only now
     p.add_argument("--full", action="store_true",
-                   help="scrape every sitemap surah / build DOCX from every surah JSON "
-                        "on disk (also writes full.json and one complete DOCX)")
+                   help="scrape every sitemap surah (also writes full.json); with --docx "
+                        "build only one complete volume, not per-surah DOCX files")
     p.add_argument("--full-quran-docx", action="store_true", dest="full_alias",
                    help=argparse.SUPPRESS)  # backwards-compatible alias
     p.add_argument("--max-ayahs", type=int, default=0,
@@ -3411,11 +3414,15 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-source", action="store_true",
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
-    if args.books and args.legacy_tafsirs:
+    if args.books and args.single_book:
+        print("[error] use either --books or --book, not both", file=sys.stderr)
+        return 2
+    if (args.books or args.single_book) and args.legacy_tafsirs:
         print("[error] use --books; --tafsirs is a legacy alias and cannot be "
               "combined with it", file=sys.stderr)
         return 2
-    books_arg = args.books or args.legacy_tafsirs
+    books_arg = (args.books or args.legacy_tafsirs
+                 or ",".join(args.single_book))
     if args.workers < 1:
         print("[error] --workers must be at least 1", file=sys.stderr)
         return 2
@@ -3693,30 +3700,15 @@ def main(argv: Optional[List[str]] = None) -> int:
 
         if build_only:
             available = local_surah_numbers(slug, json_root, book_dir=json_book)
-            surahs_for_slug = available if full_mode else surahs
             if full_mode:
+                # --full --docx is a full-volume build only. Plain --docx is
+                # the per-surah scope and does not write the combined volume.
                 print(f"[full] {slug}: {len(available)} surah JSON files on disk")
                 if not available:
                     print(f"[error] {slug}: no surah JSON found in {json_book}",
                           file=sys.stderr)
                     any_error = True
                     continue
-
-            built = build_docx_for_surahs(
-                slug, surahs_for_slug, json_root, args.docx_dir,
-                args.tafsir_font, args.font_size, args.include_source,
-                quran_font=args.quran_font, quran_classes=quran_classes,
-                bold=args.bold_tafsir, line_spacing=args.line_spacing,
-                page_color=args.page_color, quran_color=quran_color,
-                t1_color=t1_color, book_json_dir=json_book,
-                book_docx_dir=docx_book,
-            )
-            if len(built) != len(surahs_for_slug):
-                print(f"[error] {slug}: built {len(built)}/{len(surahs_for_slug)} "
-                      f"per-surah DOCX files (missing JSON or locked output)",
-                      file=sys.stderr)
-                any_error = True
-            if full_mode:
                 full_built = build_docx_for_surahs(
                     slug, available, json_root, args.docx_dir,
                     font_name=args.tafsir_font, font_size=args.font_size,
@@ -3731,6 +3723,21 @@ def main(argv: Optional[List[str]] = None) -> int:
                 if not full_built:
                     print(f"[error] {slug}: could not build "
                           f"{full_docx_name(slug, catalog, source)}", file=sys.stderr)
+                    any_error = True
+            else:
+                built = build_docx_for_surahs(
+                    slug, surahs, json_root, args.docx_dir,
+                    args.tafsir_font, args.font_size, args.include_source,
+                    quran_font=args.quran_font, quran_classes=quran_classes,
+                    bold=args.bold_tafsir, line_spacing=args.line_spacing,
+                    page_color=args.page_color, quran_color=quran_color,
+                    t1_color=t1_color, book_json_dir=json_book,
+                    book_docx_dir=docx_book,
+                )
+                if len(built) != len(surahs):
+                    print(f"[error] {slug}: built {len(built)}/{len(surahs)} "
+                          f"per-surah DOCX files (missing JSON or locked output)",
+                          file=sys.stderr)
                     any_error = True
             continue
 
