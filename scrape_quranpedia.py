@@ -26,11 +26,11 @@ Usage examples
   python scrape_quranpedia.py --combine katheer,saadi --surahs 2
   python scrape_quranpedia.py --combine katheer,saadi --full
 
-  # uloom al-Quran books use the same page structure and sitemaps
-  python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
-  # optional structured QU data source (also supports word dictionaries)
-  python scrape_quranpedia.py --uloom --from-data --tafsirs asbab --surahs 1-2
-  python scrape_quranpedia.py --uloom --tafsirs nashr --full
+  # uloom books use structured QU data by default (also supports word dictionaries)
+  python scrape_quranpedia.py --uloom --tafsirs asbab,qutayba --surahs 1-2
+  # opt back into the original full-HTML uloom pipeline
+  python scrape_quranpedia.py --uloom --from-html --tafsirs asbab --surahs 1-2
+  python scrape_quranpedia.py --uloom --tafsirs raghib --surahs 1-2
   python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
 
   # everything, 12 workers (reuse the saved catalog on repeat runs)
@@ -3039,8 +3039,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--uloom", action="store_const", dest="source", const="uloom",
                    help="shorthand for --source uloom")
     p.add_argument("--from-data", action="store_true",
-                   help="uloom only: scrape structured /uloom/_d/<s>-<a>.js "
-                        "payloads instead of full HTML pages (default: HTML)")
+                   help="uloom only: explicitly use structured "
+                        "/uloom/_d/<s>-<a>.js payloads (already the default)")
+    p.add_argument("--from-html", action="store_true",
+                   help="uloom only: opt out of the QU data default and scrape "
+                        "full HTML pages instead")
     p.add_argument("--combine",
                    help="comma-separated tafsir slugs to merge into one DOCX; "
                         "implies --docx and reads local JSON only "
@@ -3153,12 +3156,26 @@ def main(argv: Optional[List[str]] = None) -> int:
         mode = "DOCX" if build_only else "SCRAPE"
         combine_label = ""
 
-    if args.from_data and source != "uloom":
-        print("[error] --from-data is available for --source uloom only", file=sys.stderr)
+    explicit_from_data = args.from_data
+    explicit_from_html = args.from_html
+    if explicit_from_data and explicit_from_html:
+        print("[error] --from-data and --from-html are mutually exclusive",
+              file=sys.stderr)
         return 2
-    if args.from_data and build_only:
-        print("[error] --from-data cannot be used with --docx/--no-json", file=sys.stderr)
+    if source != "uloom" and (explicit_from_data or explicit_from_html):
+        flag = "--from-data" if explicit_from_data else "--from-html"
+        print(f"[error] {flag} is available for --source uloom only",
+              file=sys.stderr)
         return 2
+    if (explicit_from_data or explicit_from_html) and build_only:
+        flag = "--from-data" if explicit_from_data else "--from-html"
+        print(f"[error] {flag} cannot be used with --docx/--no-json",
+              file=sys.stderr)
+        return 2
+
+    # QU structured data is now the uloom default. --from-html opts back into
+    # the original full-page parser; tafsirs always stay on HTML.
+    args.from_data = source == "uloom" and not explicit_from_html
 
     # --docx must not touch the network, so use a local 1..114 range here.
     all_numbers = list(range(1, 115))
