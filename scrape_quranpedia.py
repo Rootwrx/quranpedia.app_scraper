@@ -287,6 +287,15 @@ def fetch_text(url: str, **kwargs) -> str:
     return fetch_bytes(url, **kwargs).decode("utf-8", "ignore")
 
 
+def network_error_hint(exc: Exception) -> str:
+    """Add a short hint for HTTP 403 browser-challenge responses."""
+    message = str(exc)
+    if "403" in message:
+        return (f"{message} (the site is returning a browser challenge; wait "
+                f"and retry, or use --docx with existing local JSON)")
+    return message
+
+
 def format_duration(seconds: float) -> str:
     """Human-readable elapsed/ETA duration."""
     total = max(0, int(seconds))
@@ -3766,7 +3775,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                     except Exception as exc:  # noqa: BLE001
                         urls = sitemap_from_cache(old_cache.get("sitemap"))
                         if not urls:
-                            raise
+                            print(f"[error] {slug}: cannot load sitemap: "
+                                  f"{network_error_hint(exc)}", file=sys.stderr)
+                            any_error = True
+                            continue
                         print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
                               f"using saved copy", file=sys.stderr)
                     else:
@@ -3800,7 +3812,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                 except Exception as exc:  # noqa: BLE001
                     urls = sitemap_from_cache(old_cache.get("sitemap"))
                     if not urls:
-                        raise
+                        print(f"[error] {slug}: cannot load sitemap: "
+                              f"{network_error_hint(exc)}", file=sys.stderr)
+                        any_error = True
+                        continue
                     print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
                           f"using saved copy", file=sys.stderr)
                 else:
