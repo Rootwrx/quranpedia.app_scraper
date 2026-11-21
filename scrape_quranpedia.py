@@ -62,6 +62,11 @@ except ImportError:  # keep the urllib fallback if requests is unavailable
     HTTPAdapter = None
 
 try:
+    import lxml.html as _lxml_html
+except ImportError:  # parsing falls back to BeautifulSoup
+    _lxml_html = None
+
+try:
     from docx import Document
     from docx.enum.style import WD_STYLE_TYPE
     from docx.oxml import OxmlElement
@@ -175,6 +180,61 @@ def configure_http_pool(workers: int) -> None:
     _HTTP_POOL_SIZE = max(8, workers + 4)
 
 
+class FetchStats:
+    """Opt-in (--stats) timing of where worker time goes: fetch vs parse."""
+
+    def __init__(self) -> None:
+        self.lock = threading.Lock()
+        self.fetch: List[float] = []
+        self.parse: List[float] = []
+        self.sizes: List[int] = []
+        self.retries = 0
+        self.failures = 0
+
+    def add(self, fetch_s: float, parse_s: float, size: int) -> None:
+        with self.lock:
+            self.fetch.append(fetch_s)
+            self.parse.append(parse_s)
+            self.sizes.append(size)
+
+    def count_retry(self) -> None:
+        with self.lock:
+            self.retries += 1
+
+    def count_failure(self) -> None:
+        with self.lock:
+            self.failures += 1
+
+    def report(self, label: str, wall: float, workers: int) -> None:
+        n = len(self.fetch)
+        if not n:
+            return
+
+        def pct(values: List[float], p: float) -> float:
+            values = sorted(values)
+            return values[min(len(values) - 1, int(len(values) * p))]
+
+        busy_fetch = sum(self.fetch)
+        busy_parse = sum(self.parse)
+        print(f"[stats] {label}: {n} pages in {wall:.1f}s = {n / wall:.1f} req/s, "
+              f"{sum(self.sizes) / 1e6:.1f} MB")
+        print(f"[stats]   fetch per page: avg {busy_fetch / n * 1000:.0f} ms, "
+              f"p50 {pct(self.fetch, .5) * 1000:.0f} ms, "
+              f"p95 {pct(self.fetch, .95) * 1000:.0f} ms, "
+              f"max {max(self.fetch) * 1000:.0f} ms")
+        print(f"[stats]   parse per page: avg {busy_parse / n * 1000:.1f} ms, "
+              f"p95 {pct(self.parse, .95) * 1000:.1f} ms "
+              f"(includes waiting for the GIL)")
+        print(f"[stats]   worker time: {busy_fetch / (wall * workers):.0%} fetching, "
+              f"{busy_parse / (wall * workers):.0%} parsing, "
+              f"{max(0.0, 1 - (busy_fetch + busy_parse) / (wall * workers)):.0%} "
+              f"other/idle  (workers={workers})")
+        print(f"[stats]   retries: {self.retries}, failed pages: {self.failures}")
+
+
+_STATS: Optional[FetchStats] = None
+
+
 def fetch_bytes(url: str, retries: int = 3, timeout: int = 30, delay: float = 0.0) -> bytes:
     """Fetch a URL with retries, keep-alive, and a small polite delay."""
     last: Optional[Exception] = None
@@ -193,6 +253,8 @@ def fetch_bytes(url: str, retries: int = 3, timeout: int = 30, delay: float = 0.
                 return resp.read()
         except Exception as exc:  # noqa: BLE001 - network errors vary
             last = exc
+            if _STATS is not None:
+                _STATS.count_retry()
             if attempt < retries - 1:
                 time.sleep(0.5 * (2 ** attempt))
     raise RuntimeError(f"Failed to fetch {url}: {last}")
@@ -1220,7 +1282,11 @@ def tafsir_html_to_segments(div) -> List[List[dict]]:
             new_line()
 
     walk(div, ())
+    return _finalize_lines(lines)
 
+
+def _finalize_lines(lines: List[List[dict]]) -> List[List[dict]]:
+    """Merge same-style runs, trim line edges and drop empty lines."""
     cleaned: List[List[dict]] = []
     for line in lines:
         # merge adjacent runs with identical styling, then trim line edges
@@ -1243,8 +1309,118 @@ def segments_to_text(segments: List[List[dict]]) -> str:
     return "\n".join("".join(seg["text"] for seg in line) for line in segments)
 
 
-def parse_ayah_page(html: str, slug: str, surah: int, ayah: int, url: str,
+_LXML_LOCAL = threading.local()
+_XP_TAFSIR = ('//div[contains(concat(" ", normalize-space(@class), " "), " tafsir ")]')
+_XP_AYA = ('//*[contains(concat(" ", normalize-space(@class), " "), " aya-h ")]'
+           '//*[contains(concat(" ", normalize-space(@class), " "), " q ")]')
+_XP_LOC = ('//h1[contains(concat(" ", normalize-space(@class), " "), " tbh ")]'
+           '//*[contains(concat(" ", normalize-space(@class), " "), " loc ")]')
+
+
+def _lxml_parser():
+    """Thread-local HTML parser (lxml releases the GIL while parsing)."""
+    parser = getattr(_LXML_LOCAL, "parser", None)
+    if parser is None:
+        parser = _lxml_html.HTMLParser(
+            encoding="utf-8", remove_comments=True, remove_pis=True)
+        _LXML_LOCAL.parser = parser
+    return parser
+
+
+def _el_classes(el) -> List[str]:
+    value = el.get("class")
+    return value.split() if value else []
+
+
+def tafsir_html_to_segments_lxml(div) -> List[List[dict]]:
+    """lxml twin of tafsir_html_to_segments(); produces identical output."""
+    if div is None:
+        return []
+    lines: List[List[dict]] = [[]]
+
+    def new_line() -> None:
+        if lines[-1]:
+            lines.append([])
+
+    def add_text(raw: Optional[str], classes: Tuple[str, ...]) -> None:
+        if raw:
+            text = re.sub(r"\s+", " ", raw.replace("\xa0", " "))
+            if text:
+                lines[-1].append({"text": text, "cls": list(classes)})
+
+    def walk(node, classes: Tuple[str, ...]) -> None:
+        own_classes = set(_el_classes(node))
+        is_block = bool(own_classes & BLOCK_TEXT_CLASSES) or node.tag in BLOCK_TAGS
+        if is_block:
+            new_line()
+        if "fr" in own_classes and lines[-1]:
+            prev = lines[-1][-1]["text"]
+            if prev and not prev.endswith((" ", "\xa0")):
+                lines[-1][-1]["text"] = prev + " "
+        add_text(node.text, classes)
+        for child in node:
+            tag = child.tag
+            if not isinstance(tag, str):  # comment / processing instruction
+                pass
+            elif tag == "br":
+                lines.append([])
+            else:
+                walk(child, classes + tuple(_el_classes(child)))
+            add_text(child.tail, classes)  # text after the child, parent's style
+        if is_block:
+            new_line()
+
+    walk(div, ())
+    return _finalize_lines(lines)
+
+
+def _first(doc, xpath: str):
+    found = doc.xpath(xpath)
+    return found[0] if found else None
+
+
+def parse_ayah_page(html, slug: str, surah: int, ayah: int, url: str,
                     include_html: bool, styled: bool) -> dict:
+    """Parse one ayah page (str or UTF-8 bytes).
+
+    Uses lxml directly instead of building a BeautifulSoup tree of the whole
+    page. Falls back to BeautifulSoup when lxml is missing or the raw tafsir
+    HTML was requested, so the output stays identical to before.
+    """
+    if _lxml_html is None or include_html:
+        if isinstance(html, bytes):
+            html = html.decode("utf-8", "ignore")
+        return _parse_ayah_page_bs4(html, slug, surah, ayah, url,
+                                    include_html, styled)
+    if isinstance(html, str):
+        html = html.encode("utf-8")
+    doc = _lxml_html.document_fromstring(html, parser=_lxml_parser())
+    body = doc.find("body")
+    tafsir_div = _first(doc, _XP_TAFSIR)
+    ayah_text_el = _first(doc, _XP_AYA)
+    label_el = _first(doc, _XP_LOC)
+
+    def text_of(el) -> str:
+        return "".join(t.strip() for t in el.itertext()) if el is not None else ""
+
+    segments = tafsir_html_to_segments_lxml(tafsir_div)
+    item = {
+        "surah": int(body.get("data-s", surah)) if body is not None else surah,
+        "ayah": int(body.get("data-a", ayah)) if body is not None else ayah,
+        "key": f"{surah}:{ayah}",
+        "ayah_text": text_of(ayah_text_el),
+        "label": text_of(label_el),
+        "tafsir_text": segments_to_text(segments),
+    }
+    if styled:
+        item["tafsir_segments"] = segments
+    item["source_url"] = url
+    return item
+
+
+def _parse_ayah_page_bs4(html: str, slug: str, surah: int, ayah: int, url: str,
+                         include_html: bool, styled: bool) -> dict:
+    """Original BeautifulSoup implementation (fallback / reference)."""
     soup = BeautifulSoup(html, "lxml")
     body = soup.body
     tafsir_div = soup.select_one("div.tafsir")
@@ -1270,10 +1446,15 @@ def parse_ayah_page(html: str, slug: str, surah: int, ayah: int, url: str,
 
 def fetch_and_parse_ayah(url: str, slug: str, surah: int, ayah: int, args) -> dict:
     """Fetch and parse one ayah entirely inside a worker thread."""
-    html = fetch_text(url, retries=args.retries, timeout=args.timeout,
-                      delay=args.delay)
-    return parse_ayah_page(html, slug, surah, ayah, url,
+    t0 = time.perf_counter()
+    html = fetch_bytes(url, retries=args.retries, timeout=args.timeout,
+                       delay=args.delay)
+    t1 = time.perf_counter()
+    item = parse_ayah_page(html, slug, surah, ayah, url,
                            args.include_html, args.styled)
+    if _STATS is not None:
+        _STATS.add(t1 - t0, time.perf_counter() - t1, len(html))
+    return item
 
 
 def write_surah_json(slug: str, surah: int, results: Dict[Tuple[int, int], dict],
@@ -1360,6 +1541,8 @@ def scrape_surahs(slug: str, surahs: List[int],
               f"({snapshot / total:.0%}) elapsed {format_duration(elapsed)} "
               f"eta {format_duration(eta)}", flush=True)
 
+    global _STATS
+    _STATS = FetchStats() if getattr(args, "stats", False) else None
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(
@@ -1374,6 +1557,8 @@ def scrape_surahs(slug: str, surahs: List[int],
                 results_by_surah[surah][pair] = fut.result()
             except Exception as exc:  # noqa: BLE001
                 print(f"[error] {slug} {surah}:{ayah}: {exc}", file=sys.stderr)
+                if _STATS is not None:
+                    _STATS.count_failure()
             completed_by_surah[surah] += 1
             with progress_lock:
                 done += 1
@@ -1387,6 +1572,9 @@ def scrape_surahs(slug: str, surahs: List[int],
                 results_by_surah.pop(surah, None)
 
     emit_progress(final=True)
+    if _STATS is not None:
+        _STATS.report(slug, time.monotonic() - start, args.workers)
+        _STATS = None
     for surah in surahs:
         written.setdefault(surah, out_dir / f"sura{surah:03d}.json")
     return written
@@ -2585,6 +2773,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--delay", type=float, default=0.0,
                    help="delay before each request, seconds")
     p.add_argument("--force", action="store_true", help="re-scrape existing surah JSON")
+    p.add_argument("--stats", action="store_true",
+                   help="print where scrape time goes (fetch vs parse, retries, "
+                        "worker utilisation); useful for tuning --workers")
     p.add_argument("--no-styled", action="store_true",
                    help="omit tafsir_segments (styled runs) from JSON")
     p.add_argument("--include-html", action="store_true",
