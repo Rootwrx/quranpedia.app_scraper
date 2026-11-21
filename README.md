@@ -44,13 +44,22 @@ index. The 78 uloom books split into two groups:
   warning for `--tafsirs all` and rejected with `[error]` if named explicitly.
   They need a separate word-entry scraper/output format.
 
-Uloom slugs do not collide with tafsir slugs. Uloom still uses the legacy
-`data/json/<slug>/` and `data/docx/<slug>/` layout; tafsirs now use Arabic
-category folders (below). You can also point `--json-dir`/`--docx-dir` at
-separate roots, and `--combine` accepts any mix of local tafsir and uloom JSON
-slugs.
+Uloom slugs do not collide with tafsir slugs. Uloom also uses Arabic category
+folders now:
 
-## Tafsir category structure
+```text
+field / coverage / book
+```
+
+The field comes from the site's `nav[data-gfilter]` groups (أسباب النزول,
+الغريب والمعاني, الإعراب, ...), and coverage comes from `em.creed` on each card
+(القرآن كله vs an ayah count). `--category` accepts group slugs such as `asbab`,
+`iraab`, or `qiraat`; `--coverage` accepts `full`, `partial`, `1`, `0`, or the
+Arabic label. `--method` remains tafsir-only. See "Category structure" below
+for the shared folder rules. You can point `--json-dir`/`--docx-dir` at separate
+roots, and `--combine` accepts any mix of local tafsir and uloom JSON slugs.
+
+## Category structure
 
 Tafsirs use a three-level Arabic hierarchy under the source name:
 
@@ -99,6 +108,33 @@ Older `data/<json|docx>/<slug>/` folders and the previous two-level Arabic
 `data/<json|docx>/tafseer/<era>/<name>/` folders are detected and moved into the
 nested layout automatically on the next scrape. `--docx` can still read both
 older layouts if no catalog is present.
+
+Uloom uses a two-level Arabic hierarchy under the source name:
+
+```text
+field / coverage / book
+```
+
+The scraper reads the group buttons in `nav[data-gfilter]`, each book card's
+`data-g`, and `em.creed`, then saves `data/json/catalog-uloom.json`. Declared
+button counts and observed card counts are stored for every field. If a book is
+listed under more than one field or coverage, the catalog and `meta.json` keep
+all values in `fields` and `coverages`; `facets.field` / `facets.coverage` and
+`path_categories` hold the canonical folder choice. Canonical order follows the
+site's group filter (full before partial for coverage).
+
+Uloom output paths are:
+
+```
+data/json/uloom/<field>/<coverage>/<Arabic book name>/meta.json
+data/json/uloom/<field>/<coverage>/<Arabic book name>/suraNNN.json
+data/json/uloom/<field>/<coverage>/<Arabic book name>/full.json
+data/docx/uloom/<field>/<coverage>/<Arabic book name>/<Arabic book name>-full.docx
+```
+
+Legacy `data/<json|docx>/<slug>/` uloom folders are detected and moved into this
+layout on the next scrape. `--docx` still reads them when no uloom catalog is
+present.
 
 ## Books library support
 
@@ -198,15 +234,16 @@ Three explicit operations:
 scrape and DOCX operations. `--combine` is local-only and accepts slugs from
 either source.
 
-Tafsir selection supports `--tafsirs slug1,slug2`, `--all`, repeatable
-`--category` values, and the `--method` / `--coverage` facet filters. `--source`
-still selects tafseer vs. uloom; the category and facet filters are tafsir-only.
+Selection supports `--tafsirs slug1,slug2`, `--all`, repeatable `--category`
+values, and the `--coverage` facet filter for both sources. `--method` is
+tafsir-only. `--source` selects the index: tafseer or uloom.
 
 Scraping defaults to 12 workers. All surahs for a book share one fetch queue,
 so every worker stays busy even when a surah is small. Repeat runs can add
-`--use-local-catalog` to skip re-fetching the tafsir index and reuse
-`data/json/catalog-tafseer.json`; it errors if no saved catalog exists. Raising
-`--workers` above 12 rarely helps because the site throttles requests; lower it
+`--use-local-catalog` to skip re-fetching the index and reuse
+`data/json/catalog-tafseer.json` or `data/json/catalog-uloom.json`; it errors
+if no saved catalog exists. Raising `--workers` above 12 rarely helps because
+the site throttles requests; lower it
 if you see rate-limit errors.
 
 All three operations support the same two scopes:
@@ -224,8 +261,8 @@ Scrape details:
    facets, folder path, source URLs, sitemap URL, and surah list/count).
 2. Writes **per-surah JSON** under the nested Arabic folder
    (`data/json/tafseer/<era>/<method>/<coverage>/<name>/suraNNN.json` for
-   tafsirs; legacy `data/json/<slug>/suraNNN.json` for uloom). Canonical and
-   resumable.
+   tafsirs; `data/json/uloom/<field>/<coverage>/<name>/suraNNN.json` for uloom).
+   Canonical and resumable.
 3. `--full` additionally writes `full.json` (or `<slug>-full.json` in legacy
    layout), streamed from every surah JSON on disk for that tafsir (partial
    tafsirs work too).
@@ -240,8 +277,9 @@ Scrape details:
 DOCX details:
 
 - one per surah: `data/docx/tafseer/<era>/<method>/<coverage>/<name>/NNN سورة <اسم السورة>.docx`
-  for tafsirs (legacy `data/docx/<slug>/NNN سورة <اسم السورة>.docx` for uloom),
-  e.g. `001 سورة الفاتحة.docx` — no English surah name in headings or filenames
+  for tafsirs (`data/docx/uloom/<field>/<coverage>/<name>/NNN سورة <اسم السورة>.docx`
+  for uloom), e.g. `001 سورة الفاتحة.docx` — no English surah name in headings
+  or filenames
 - one full-tafsir volume with `--full`: `<Arabic tafsir name>-full.docx`
   (`<slug>-full.docx` in legacy layout)
 - combined volumes with `--combine katheer,saadi`:
@@ -358,6 +396,7 @@ python scrape_quranpedia.py --tafsirs all --full --docx
 # uloom al-Quran: same pipeline, different index
 python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
 python scrape_quranpedia.py --uloom --tafsirs nashr --full
+python scrape_quranpedia.py --source uloom --category asbab --coverage full
 python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
 
 # combine tafsirs from local JSON: verse, then each tafsir under it
@@ -404,13 +443,15 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
 - Modes: default = scrape only; `--docx` = build DOCX only, no network. ✅
 - Both modes support per-surah (`--surahs`) and full (`--full`) scopes. ✅
 - JSON: `meta.json` first, then per-surah files; `--full` additionally writes
-  `full.json`. Tafsirs use nested Arabic era/method/coverage folders; uloom
-  remains slug-first until its category pass. ✅
+  `full.json`. Tafsirs use nested Arabic era/method/coverage folders; uloom uses
+  nested Arabic field/coverage folders. Legacy slug folders are migrated. ✅
 - DOCX: per-surah files plus `<Arabic tafsir name>-full.docx` with `--full`.
   Arabic-only surah names, plus a metadata cover page. ✅
 - Tafsir categories: five era sections, المنهج and التغطية facets from the
   filter selects/card attributes, plus the popular shelf and card marks as
-  extra `--category` filters. Older folders are migrated on the next scrape. ✅
+  extra `--category` filters. Uloom categories: group buttons, `data-g`, and
+  `em.creed`; both sources keep all facet values in catalog/meta and use
+  canonical values for one folder per book. Older folders are migrated. ✅
 - `--combine` merges selected tafsirs locally into verse-first DOCX files, with
   one level-2 tafsir heading per selected tafsir under each verse. ✅
 - `--full` scraping uses each tafsir's sitemap, so partial tafsirs only include

@@ -81,6 +81,8 @@ SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
 DEFAULT_CATEGORY_NAME = "غير مصنف"
 METHOD_OTHER_SLUG = "method-other"
 METHOD_OTHER_NAME = "غير محدد المنهج"
+COVERAGE_FULL_SLUG = "coverage-full"
+COVERAGE_PARTIAL_SLUG = "coverage-partial"
 COVERAGE_OTHER_SLUG = "coverage-unspecified"
 COVERAGE_OTHER_NAME = "غير محدد التغطية"
 
@@ -284,6 +286,229 @@ def build_display_names(books: Dict[str, dict]) -> Dict[str, str]:
     return result
 
 
+def _build_uloom_catalog(soup) -> dict:
+    """Build a local catalog from the uloom index's group filter and cards."""
+    categories: List[dict] = []
+    books: Dict[str, dict] = {}
+    category_by_key: Dict[Tuple[str, str], dict] = {}
+
+    def add_category(slug: str, name: str, kind: str,
+                     declared: Optional[int] = None,
+                     aliases: Iterable[str] = ()) -> dict:
+        key = (kind, slug)
+        cat = category_by_key.get(key)
+        if cat is None:
+            cat = {
+                "slug": slug,
+                "name": clean_label(name),
+                "kind": kind,
+                "declared_count": declared,
+                "observed_book_count": 0,
+                "aliases": [clean_label(a) for a in aliases if clean_label(a)],
+            }
+            category_by_key[key] = cat
+            categories.append(cat)
+        else:
+            if declared is not None and cat.get("declared_count") is None:
+                cat["declared_count"] = declared
+            for alias in aliases:
+                value = clean_label(alias)
+                if value and value not in cat.get("aliases", []):
+                    cat.setdefault("aliases", []).append(value)
+        return cat
+
+    def cat_ref(cat: dict) -> dict:
+        return {"slug": cat["slug"], "name": cat["name"], "kind": cat["kind"]}
+
+    def add_to_entry(entry: dict, cat: dict) -> None:
+        existing = entry.setdefault("categories", [])
+        if not any(c.get("slug") == cat["slug"] and c.get("kind") == cat["kind"]
+                   for c in existing):
+            existing.append(cat_ref(cat))
+
+    def ensure_book(slug: str) -> dict:
+        entry = books.get(slug)
+        if entry is None:
+            display = slug
+            entry = {
+                "slug": slug,
+                "display_name": display,
+                "name": display,
+                "title": display,
+                "author": "",
+                "death_hijri": "",
+                "category": {"slug": "", "name": DEFAULT_CATEGORY_NAME, "kind": "field"},
+                "facets": {},
+                "fields": [],
+                "coverages": [],
+                "categories": [],
+                "path_categories": [],
+                "cards": [],
+                "source": f"{BASE}/uloom/{slug}/index.html",
+            }
+            books[slug] = entry
+        return entry
+
+    fields: Dict[str, dict] = {}
+    for button in soup.select("nav[data-gfilter] button[data-g]"):
+        slug = clean_label(button.get("data-g") or "")
+        if not slug or slug == "all":
+            continue
+        count_el = button.find("span")
+        count_text = clean_label(count_el.get_text(" ", strip=True)) if count_el else ""
+        label = clean_label(button.get_text(" ", strip=True))
+        if count_text:
+            label = clean_label(label.replace(count_text, "", 1))
+        if not label:
+            continue
+        nums = re.findall(r"\d+", count_text) if count_text else []
+        declared = int(nums[-1]) if nums else None
+        fields[slug] = add_category(slug, label, "field", declared, [slug, label])
+    field_other = add_category("uncategorized", DEFAULT_CATEGORY_NAME, "field",
+                               aliases=["other"])
+
+    coverage_full = add_category(
+        COVERAGE_FULL_SLUG, "القرآن كاملاً", "coverage",
+        aliases=["full", "1", "القرآن كله", "كامل"])
+    coverage_partial = add_category(
+        COVERAGE_PARTIAL_SLUG, "سور وآيات منه", "coverage",
+        aliases=["partial", "0", "آية", "آيات", "جزئي"])
+    coverage_other = add_category(
+        COVERAGE_OTHER_SLUG, COVERAGE_OTHER_NAME, "coverage", aliases=["unknown"])
+
+    # The group filter's DOM order, then full-before-partial, decide canonical
+    # folders if a book ever appears under more than one field or coverage.
+    field_order = {cat["slug"]: idx for idx, cat in enumerate(fields.values())}
+    field_order[field_other["slug"]] = len(field_order)
+    coverage_order = {
+        coverage_full["slug"]: 0,
+        coverage_partial["slug"]: 1,
+        coverage_other["slug"]: 2,
+    }
+
+    container = soup.select_one("ul[data-gcards]") or soup
+    for li in container.select("li"):
+        link = li.select_one("a.tcard[href]")
+        if link is None:
+            continue
+        match = re.search(r"\./([a-z0-9-]+)/index\.html", str(link.get("href") or ""))
+        if not match:
+            continue
+        slug = match.group(1)
+        entry = ensure_book(slug)
+
+        title_el = link.select_one("b")
+        full_el = link.select_one("i")
+        author_el = link.select_one("small")
+        creed_el = link.select_one("em.creed")
+        if title_el:
+            label = clean_label(title_el.get_text(" ", strip=True))
+            if label:
+                entry["display_name"] = label
+                entry["name"] = label
+        if full_el:
+            entry["title"] = clean_label(full_el.get_text(" ", strip=True)) or entry["title"]
+        if author_el:
+            author_text = clean_label(author_el.get_text(" ", strip=True))
+            author_text = re.sub(
+                r"\(\s*\d+\s*-\s*\d+\s*هـ\s*\)|\(\s*ت\s*\d+\s*هـ\s*\)",
+                "", author_text).strip()
+            if author_text:
+                entry["author"] = author_text
+            death = re.search(r"\((\d+)\s*-\s*(\d+)\s*هـ\)|ت\s*(\d+)\s*هـ",
+                              author_el.get_text(" ", strip=True))
+            if death:
+                entry["death_hijri"] = death.group(2) or death.group(3) or ""
+
+        field_slug = clean_label(li.get("data-g") or "")
+        field_cat = fields.get(field_slug, field_other)
+        creed = clean_label(creed_el.get_text(" ", strip=True)) if creed_el else ""
+        if "القرآن كله" in creed:
+            coverage_cat = coverage_full
+        elif "آية" in creed or "آيات" in creed:
+            coverage_cat = coverage_partial
+        else:
+            coverage_cat = coverage_other
+
+        add_to_entry(entry, field_cat)
+        add_to_entry(entry, coverage_cat)
+        entry["cards"].append({
+            "field": field_slug,
+            "field_category": field_cat["slug"],
+            "creed": creed,
+            "coverage_category": coverage_cat["slug"],
+            "url": f"{BASE}/uloom/{slug}/index.html",
+            "label": clean_label(title_el.get_text(" ", strip=True)) if title_el else "",
+        })
+
+        for mark in link.select(".tc-tg .mark, .mark"):
+            label = clean_label(mark.get_text(" ", strip=True))
+            if label:
+                add_to_entry(entry, add_category(tag_slug(label), label, "tag"))
+
+    def ordered_refs(entry: dict, kind: str, card_key: str, order: dict,
+                     fallback: dict) -> List[dict]:
+        """All facet values for this book, in the site's filter order."""
+        slugs = [
+            card[card_key] for card in entry.get("cards", [])
+            if card.get(card_key) and (kind, card[card_key]) in category_by_key
+        ]
+        ref = (entry.get("facets") or {}).get(kind)
+        if ref and ref.get("slug") and (kind, ref["slug"]) in category_by_key:
+            slugs.append(ref["slug"])
+        unique = sorted(set(slugs), key=lambda s: (order.get(s, len(order)), s))
+        refs = [cat_ref(category_by_key[(kind, s)]) for s in unique]
+        return refs or [dict(fallback)]
+
+    for entry in books.values():
+        facets = entry.setdefault("facets", {})
+        field_refs = ordered_refs(
+            entry, "field", "field_category", field_order, cat_ref(field_other))
+        coverage_refs = ordered_refs(
+            entry, "coverage", "coverage_category", coverage_order,
+            cat_ref(coverage_other))
+        entry["fields"] = field_refs
+        entry["coverages"] = coverage_refs
+        facets["field"] = field_refs[0]
+        facets["coverage"] = coverage_refs[0]
+        entry["category"] = dict(facets["field"])
+        entry["path_categories"] = [
+            dict(facets["field"]), dict(facets["coverage"])]
+        for kind, ref in (("field", facets["field"]), ("coverage", facets["coverage"])):
+            add_to_entry(entry, category_by_key[(kind, ref["slug"])])
+
+    for cat in categories:
+        cat["observed_book_count"] = sum(
+            1 for entry in books.values()
+            if any(c.get("slug") == cat["slug"] and c.get("kind") == cat["kind"]
+                   for c in entry.get("categories", []))
+        )
+        if cat["kind"] == "coverage" and cat["declared_count"] is None:
+            cat["declared_count"] = cat["observed_book_count"]
+
+    categories[:] = [
+        cat for cat in categories
+        if cat["observed_book_count"] or cat["slug"] == "uncategorized"
+    ]
+
+    display_names = build_display_names(books)
+    for slug, display in display_names.items():
+        books[slug]["display_name"] = display
+        books[slug]["name"] = display
+
+    return {
+        "source": "uloom",
+        "source_index": ULOOM_INDEX,
+        "sitemap_index": SITEMAP_INDEX,
+        "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "total_books": len(books),
+        "total_categories": len(categories),
+        "categories": categories,
+        "display_names": display_names,
+        "books": dict(sorted(books.items())),
+    }
+
+
 def build_catalog(source: str, names: Dict[str, str], *,
                   index_html: Optional[str] = None,
                   retries: int = 3, timeout: int = 30,
@@ -294,19 +519,27 @@ def build_catalog(source: str, names: Dict[str, str], *,
 
         era / method / coverage / book
 
-    The era comes from the five h2.era-h sections on /tafseer/index.html.
+    Uloom folders are nested:
+
+        field / coverage / book
+
+    The tafsir era comes from the five h2.era-h sections on /tafseer/index.html.
     Method (المنهج) and coverage (التغطية) come from the filter selects and the
     stable data-k / data-f attributes on each card's <li>. The overlapping
     "الأكثر قراءة" shelf and card marks remain extra selectable categories.
-    """
-    if source != "tafseer":
-        return {"source": source, "source_index": ULOOM_INDEX,
-                "categories": [], "books": {},
-                "note": "category catalog not implemented for this source yet"}
 
+    The uloom field comes from nav[data-gfilter] and each li[data-g]; coverage
+    comes from em.creed ("القرآن كله" vs an ayah count).
+    """
+    if source not in SOURCE_PATHS:
+        raise ValueError(f"unknown catalog source: {source}")
+
+    index_url = TAFSEER_INDEX if source == "tafseer" else ULOOM_INDEX
     html = index_html if index_html is not None else fetch_text(
-        TAFSEER_INDEX, retries=retries, timeout=timeout, delay=delay)
+        index_url, retries=retries, timeout=timeout, delay=delay)
     soup = BeautifulSoup(html, "lxml")
+    if source == "uloom":
+        return _build_uloom_catalog(soup)
     categories: List[dict] = []
     books: Dict[str, dict] = {}
     category_by_key: Dict[Tuple[str, str], dict] = {}
@@ -630,11 +863,11 @@ def slugs_from_facets(catalog: dict, *, methods: Iterable[str] = (),
 
 
 def uses_arabic_layout(catalog: dict, source: str) -> bool:
-    return source == "tafseer" and bool(catalog.get("books"))
+    return source in SOURCE_PATHS and bool(catalog.get("books"))
 
 
 def path_categories(entry: dict) -> List[str]:
-    """Arabic folder components for a book: era, method, coverage."""
+    """Arabic folder components: tafsir era/method/coverage or uloom field/coverage."""
     components: List[str] = []
     for ref in entry.get("path_categories", []):
         name = clean_label(ref.get("name") or "")
@@ -660,7 +893,9 @@ def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
 
     New tafsir layout:
         <root>/tafseer/<era>/<method>/<coverage>/<Arabic tafsir name>/
-    Older layout:
+    New uloom layout:
+        <root>/uloom/<field>/<coverage>/<Arabic book name>/
+    Older tafsir layout:
         <root>/tafseer/<era>/<Arabic tafsir name>/
     Legacy layout:
         <root>/<slug>/
@@ -758,6 +993,11 @@ def resolve_book_paths(json_dir: Path, docx_dir: Path, source: str, slug: str,
         except OSError as exc:
             print(f"[warn] {slug}: cannot move {src}: {exc}", file=sys.stderr)
 
+    if not migrate:
+        # DOCX mode must read JSON from the location that actually has data,
+        # even when a catalog is present. Output always goes to the canonical
+        # DOCX folder.
+        return existing_json, new_docx
     move(existing_json, new_json, "json")
     move(existing_docx, new_docx, "docx")
     return new_json, new_docx
@@ -808,6 +1048,8 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
     facets = catalog_entry.get("facets") or tafsir_meta.get("facets") or {}
     methods = (catalog_entry.get("methods") or tafsir_meta.get("methods")
                or ([facets["method"]] if facets.get("method") else []))
+    fields = (catalog_entry.get("fields") or tafsir_meta.get("fields")
+              or ([facets["field"]] if facets.get("field") else []))
     coverages = (catalog_entry.get("coverages") or tafsir_meta.get("coverages")
                  or ([facets["coverage"]] if facets.get("coverage") else []))
     meta.update({
@@ -821,6 +1063,7 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
         "facets": facets,
         "path_categories": catalog_entry.get("path_categories") or [],
         "methods": methods,
+        "fields": fields,
         "coverages": coverages,
         "catalog_entry": catalog_entry,
         "source": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
@@ -884,6 +1127,7 @@ def get_book_meta(slug: str, names: Dict[str, str],
         "facets": catalog_entry.get("facets", {}),
         "path_categories": catalog_entry.get("path_categories", []),
         "methods": catalog_entry.get("methods", []),
+        "fields": catalog_entry.get("fields", []),
         "coverages": catalog_entry.get("coverages", []),
         "source": f"{BASE}/{path}/{slug}/index.html",
     }
@@ -2301,14 +2545,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--all", action="store_true",
                    help="select every book in the selected source (alias for --tafsirs all)")
     p.add_argument("--category", dest="categories", action="append", default=[],
-                   help="select tafsirs by Arabic category name, era/method/coverage "
-                        "slug, or tag (repeatable; tafsirs only)")
+                   help="select tafsirs or uloom books by Arabic category name, "
+                        "era/group/method/coverage slug, or tag (repeatable)")
     p.add_argument("--method", dest="methods", action="append", default=[],
                    help="select by المنهج: athar, ahkam, lugha, tadabbur, muyassar, other "
                         "(repeatable; tafsirs only)")
     p.add_argument("--coverage", dest="coverages", action="append", default=[],
                    help="select by التغطية: full, partial, 1, 0, or Arabic label "
-                        "(repeatable; tafsirs only)")
+                        "(repeatable)")
     p.add_argument("--source", choices=sorted(SOURCE_PATHS), default="tafseer",
                    help="book index to use: tafseer (default) or uloom")
     p.add_argument("--uloom", action="store_const", dest="source", const="uloom",
@@ -2429,12 +2673,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     names: Dict[str, str] = {}
     surah_meta: List[dict] = []
 
-    if source == "tafseer":
+    catalog_label = "tafsir" if source == "tafseer" else "uloom"
+    if source in SOURCE_PATHS:
         if build_only or args.use_local_catalog:
             catalog = load_local_catalog(cat_path)
             if not catalog:
                 if build_only:
-                    print(f"[warn] no local tafsir catalog at {cat_path}; "
+                    print(f"[warn] no local {catalog_label} catalog at {cat_path}; "
                           f"using legacy <slug> folders", file=sys.stderr)
                 else:
                     print(f"[error] --use-local-catalog needs an existing catalog at "
@@ -2455,9 +2700,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif not build_only:
         surah_meta, names, _short = load_quran_data()
 
-    if facet_values and source != "tafseer":
-        print("[error] --category/--method/--coverage are available for tafsirs only",
-              file=sys.stderr)
+    if source == "uloom" and methods:
+        print("[error] --method is available for tafsirs only", file=sys.stderr)
         return 2
 
     if not combine_slugs:
@@ -2505,12 +2749,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         if source == "uloom":
             bad = [s for s in slugs if s in ULOOM_WORD_SLUGS]
             if bad:
-                print(f"[error] {', '.join(bad)}: word-based uloom book(s) are not "
-                      f"supported by --source uloom; they need a word-entry scraper",
-                      file=sys.stderr)
-                return 1
+                bad_explicit = [s for s in bad if s in explicit_slugs]
+                if bad_explicit:
+                    print(f"[error] {', '.join(bad_explicit)}: word-based uloom book(s) "
+                          f"are not supported by --source uloom; they need a "
+                          f"word-entry scraper", file=sys.stderr)
+                    return 1
+                slugs = [s for s in slugs if s not in ULOOM_WORD_SLUGS]
+                if slugs:
+                    print(f"[warn] skipping {len(bad)} unsupported word-based "
+                          f"uloom book(s): {', '.join(bad)}", file=sys.stderr)
         if not slugs:
-            print("[error] no tafsirs matched the selection", file=sys.stderr)
+            noun = "books" if source == "uloom" else "tafsirs"
+            print(f"[error] no {noun} matched the selection", file=sys.stderr)
             return 1
 
     label = "Books" if source == "uloom" else "Tafsirs"
