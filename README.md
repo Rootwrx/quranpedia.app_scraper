@@ -39,7 +39,7 @@ index. The 78 uloom books split into two groups:
   `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are not ayah-based. Their
   sitemaps list `/w/<root>.html` entries with `.well` content. Their `sura*.html`
   URLs are byte-identical Baghawy tafsir pages, so HTML mode skips them with a
-  warning for `--tafsirs all` and rejects them with `[error]` if named
+  warning for `--books all` and rejects them with `[error]` if named
   explicitly.
 - **Structured QU data is the default for all 78 uloom books.** It fetches
   `https://quranpedia.app/uloom/_d/<s>-<a>.js` instead of full HTML pages. It
@@ -241,9 +241,11 @@ Three explicit operations:
 scrape and DOCX operations. `--combine` is local-only and accepts slugs from
 either source.
 
-Selection supports `--tafsirs slug1,slug2`, `--all`, repeatable `--category`
+Selection supports `--books slug1,slug2`, `--all`, repeatable `--category`
 values, and the `--coverage` facet filter for both sources. `--method` is
-tafsir-only. `--source` selects the index: tafseer or uloom.
+tafsir-only. `--source` (or `--uloom`) selects the index: tafseer or uloom.
+`--tafsirs` is still accepted as a legacy alias for `--books`; prefer `--books`
+in new commands because it works for both sources.
 
 Scraping defaults to 12 workers. All surahs for a book share one fetch queue,
 so every worker stays busy even when a surah is small. Repeat runs can add
@@ -373,14 +375,14 @@ file that `--full` would otherwise write.
 pip install -r requirements.txt
 
 # scrape Al-Faatiha from tafsir Tabary -> JSON only
-python scrape_quranpedia.py --tafsirs tabary --surahs 1
+python scrape_quranpedia.py --books tabary --surahs 1
 
 # build DOCX only from the JSON already downloaded (no network)
-python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx
+python scrape_quranpedia.py --books tabary --surahs 1 --docx
 
 # same two scopes for surahs 1-3 across two tafsirs
-python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3
-python scrape_quranpedia.py --tafsirs tabary,moyassar --surahs 1-3 --docx
+python scrape_quranpedia.py --books tabary,moyassar --surahs 1-3
+python scrape_quranpedia.py --books tabary,moyassar --surahs 1-3 --docx
 
 # nested category / facet selection; all filters are repeatable and intersect
 python scrape_quranpedia.py --category المتقدمون --full
@@ -390,24 +392,24 @@ python scrape_quranpedia.py --method lugha --coverage partial --full --docx
 python scrape_quranpedia.py --all --full --docx
 
 # full mode: scrape everything, then build everything separately
-python scrape_quranpedia.py --tafsirs katheer --full
-python scrape_quranpedia.py --tafsirs katheer --full --docx
+python scrape_quranpedia.py --books katheer --full
+python scrape_quranpedia.py --books katheer --full --docx
 
 # repeat/full runs: reuse the saved catalog and every worker across all surahs
-python scrape_quranpedia.py --tafsirs tabary --full --workers 12 --use-local-catalog
+python scrape_quranpedia.py --books tabary --full --workers 12 --use-local-catalog
 
 # all 71 tafsirs (large: ~318k pages, tens of GB of HTML)
-python scrape_quranpedia.py --tafsirs all --full --workers 12
-python scrape_quranpedia.py --tafsirs all --full --docx
+python scrape_quranpedia.py --books all --full --workers 12
+python scrape_quranpedia.py --books all --full --docx
 
 # uloom al-Quran: structured QU data is the default (word dicts included)
-python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
-python scrape_quranpedia.py --uloom --tafsirs raghib --surahs 1-2
+python scrape_quranpedia.py --source uloom --books asbab,qutayba --surahs 1-2
+python scrape_quranpedia.py --uloom --books raghib --surahs 1-2
 # opt back into the original full-HTML uloom pipeline
-python scrape_quranpedia.py --uloom --from-html --tafsirs asbab --surahs 1-2
-python scrape_quranpedia.py --uloom --tafsirs nashr --full
+python scrape_quranpedia.py --uloom --from-html --books asbab --surahs 1-2
+python scrape_quranpedia.py --uloom --books nashr --full
 python scrape_quranpedia.py --source uloom --category asbab --coverage full
-python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
+python scrape_quranpedia.py --source uloom --books all --full --docx
 
 # combine tafsirs from local JSON: verse, then each tafsir under it
 python scrape_quranpedia.py --combine katheer,saadi --surahs 2
@@ -418,7 +420,7 @@ python scrape_quranpedia.py --combine katheer,saadi --full --combine-name "kathe
 python scrape_quranpedia.py --combine asbab,qutayba --surahs 1
 
 # tune fonts / which tafsir classes count as Quran text
-python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx \
+python scrape_quranpedia.py --books tabary --surahs 1 --docx \
   --tafsir-font "KFGQPC Uthman Taha Naskh" --quran-font Kitab \
   --quran-classes qa,qr,t3,t1 --t1-color '#FF4500'
 ```

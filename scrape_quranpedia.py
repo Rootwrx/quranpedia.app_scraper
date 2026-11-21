@@ -6,16 +6,17 @@ ayah. Example: https://quranpedia.app/tafseer/tabary/sura1-aya1.html
 
 Usage examples
 --------------
+  # --books selects slugs for whichever source is active
   # scrape 7 ayahs of Al-Faatiha from tafsir tabary -> per-surah JSON only
   # (tafsir output is category-first with Arabic folder names)
-  python scrape_quranpedia.py --tafsirs tabary --surahs 1
+  python scrape_quranpedia.py --books tabary --surahs 1
 
   # build DOCX only (no network/scraping) from already-downloaded JSON
-  python scrape_quranpedia.py --tafsirs tabary --surahs 1 --docx
+  python scrape_quranpedia.py --books tabary --surahs 1 --docx
 
   # full mode works for both: scrape all surahs, or build all DOCX files
-  python scrape_quranpedia.py --tafsirs tabary --full
-  python scrape_quranpedia.py --tafsirs tabary --full --docx
+  python scrape_quranpedia.py --books tabary --full
+  python scrape_quranpedia.py --books tabary --full --docx
 
   # select tafsirs by nested category: era / method / coverage
   python scrape_quranpedia.py --category المتقدمون --surahs 1
@@ -27,14 +28,16 @@ Usage examples
   python scrape_quranpedia.py --combine katheer,saadi --full
 
   # uloom books use structured QU data by default (also supports word dictionaries)
-  python scrape_quranpedia.py --uloom --tafsirs asbab,qutayba --surahs 1-2
+  python scrape_quranpedia.py --uloom --books asbab,qutayba --surahs 1-2
   # opt back into the original full-HTML uloom pipeline
-  python scrape_quranpedia.py --uloom --from-html --tafsirs asbab --surahs 1-2
-  python scrape_quranpedia.py --uloom --tafsirs raghib --surahs 1-2
-  python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
+  python scrape_quranpedia.py --uloom --from-html --books asbab --surahs 1-2
+  python scrape_quranpedia.py --uloom --books raghib --surahs 1-2
+  python scrape_quranpedia.py --uloom --books all --full --docx
 
   # everything, 12 workers (reuse the saved catalog on repeat runs)
-  python scrape_quranpedia.py --tafsirs all --full --workers 12 --use-local-catalog
+  python scrape_quranpedia.py --books all --full --workers 12 --use-local-catalog
+
+  --tafsirs is still accepted as a legacy alias for --books.
 
 Dependencies: requests, beautifulsoup4, lxml, python-docx
 """
@@ -3021,10 +3024,13 @@ def local_surah_numbers(slug: str, json_dir: Path, *,
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tafsirs", default=None,
-                   help="comma-separated tafsir/book slugs, or 'all' (default: tabary)")
+    p.add_argument("--books", default=None,
+                   help="comma-separated book slugs for the selected source, or 'all' "
+                        "(default: tabary for tafsirs; use --uloom --books <slug> for uloom)")
+    p.add_argument("--tafsirs", dest="legacy_tafsirs", default=None,
+                   help=argparse.SUPPRESS)  # legacy alias for --books
     p.add_argument("--all", action="store_true",
-                   help="select every book in the selected source (alias for --tafsirs all)")
+                   help="select every book in the selected source (alias for --books all)")
     p.add_argument("--category", dest="categories", action="append", default=[],
                    help="select tafsirs or uloom books by Arabic category name, "
                         "era/group/method/coverage slug, or tag (repeatable)")
@@ -3120,6 +3126,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-source", action="store_true",
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
+    if args.books and args.legacy_tafsirs:
+        print("[error] use --books; --tafsirs is a legacy alias and cannot be "
+              "combined with it", file=sys.stderr)
+        return 2
+    books_arg = args.books or args.legacy_tafsirs
     if args.workers < 1:
         print("[error] --workers must be at least 1", file=sys.stderr)
         return 2
@@ -3239,7 +3250,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 2
 
     if not combine_slugs:
-        explicit = split_values([args.tafsirs]) if args.tafsirs else []
+        explicit = split_values([books_arg]) if books_arg else []
         if not facet_values and not args.all and not explicit:
             explicit = ["tabary"]
         wants_all = args.all or any(v.lower() in ("all", "*") for v in explicit)
@@ -3287,8 +3298,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 bad_explicit = [s for s in bad if s in explicit_slugs]
                 if bad_explicit:
                     print(f"[error] {', '.join(bad_explicit)}: word-based uloom book(s) "
-                          f"are not supported by --source uloom; they need a "
-                          f"word-entry scraper or --from-data", file=sys.stderr)
+                          f"are not supported in --from-html mode; omit it to use "
+                          f"the default QU data mode", file=sys.stderr)
                     return 1
                 slugs = [s for s in slugs if s not in ULOOM_WORD_SLUGS]
                 if slugs:
