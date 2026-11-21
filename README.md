@@ -248,6 +248,27 @@ Selection supports `--books slug1,slug2`, the repeatable singular alias
 still accepted as a legacy alias for `--books`; prefer `--books`/`--book` in
 new commands because they work for both sources.
 
+## Configuration file
+
+User-editable site lists and defaults live in `config.json` next to the scripts,
+so you do not need to read or edit Python to add a dictionary. The important
+sections are:
+
+- `uloom.word_slugs`: the 9 word/root dictionaries. Add or remove slugs here to
+  control which uloom books use the headword `_r` pipeline instead of ayah `_d`
+  data.
+- `uloom.word_to_html`: tanween character mapping between QU data and HTML.
+- `urls`: site URL templates, including `_d`, `_r`, sitemap, and index paths.
+- `parsing.block_text_classes` / `parsing.block_tags`: inline block rules.
+- `docx`: page color, Quran/t1 colors, and Word heading style names.
+- `defaults`: workers, retries, timeout, fonts, font size, and line spacing.
+- `files`: catalog, surah-cache, fetch-cache, and headword JSON filenames.
+- `books`: books-library URLs and paths, fonts, colors, and name truncation.
+
+Set `QURANPEDIA_CONFIG=/path/to/other.json` to use a different config file.
+Missing keys inherit built-in defaults; a malformed file or value prints a
+warning and uses the defaults. `scrape_books.py` reads the same config file.
+
 Scraping defaults to 12 workers. All surahs for a book share one fetch queue,
 so every worker stays busy even when a surah is small. Repeat runs can add
 `--use-local-catalog` to skip re-fetching the index and reuse
@@ -261,7 +282,7 @@ All three operations support the same two scopes:
 - per surah via `--surahs 1`, `--surahs 1-3`, etc.
 - full via `--full` (or `--surahs all`):
   - scrape mode: every surah in that tafsir's sitemap, plus `full.json`
-  - DOCX mode: every surah with JSON on disk, plus `<Arabic tafsir name>-full.docx`
+  - DOCX mode: only `<Arabic tafsir name>-full.docx` (no per-surah DOCX)
   - combine mode: the union of surahs available across the selected tafsirs,
     plus `<label>-full.docx`
 

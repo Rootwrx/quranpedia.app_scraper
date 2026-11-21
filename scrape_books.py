@@ -28,6 +28,9 @@ Examples
   python scrape_books.py --category iraab --workers 4
   python scrape_books.py --all --workers 8
   python scrape_books.py --all --docx
+
+Site URLs, output paths, fonts, and colors come from config.json, shared with
+scrape_quranpedia.py. Set QURANPEDIA_CONFIG to load another config file.
 """
 
 from __future__ import annotations
@@ -46,20 +49,26 @@ from urllib.parse import urljoin
 import scrape_quranpedia as sq
 from bs4 import BeautifulSoup, NavigableString, Tag
 
-BASE = "https://quranpedia.app"
-BOOKS_INDEX = f"{BASE}/books/index.html"
-SITEMAP_INDEX = f"{BASE}/sitemap.xml"
-BOOK_SITEMAP = BASE + "/sitemap-books-{}.xml"
+BOOKS_CFG = sq.config_section("books")
 
-DEFAULT_JSON_DIR = Path("data/books/json")
-DEFAULT_DOCX_DIR = Path("data/books/docx")
-DEFAULT_CATALOG_FILE = Path("data/books/catalog.json")
+BASE = sq.BASE
+BOOKS_INDEX = sq.BOOKS_INDEX_URL
+SITEMAP_INDEX = sq.BOOKS_SITEMAP_INDEX_URL
+BOOK_SITEMAP = sq.BOOKS_BOOK_SITEMAP_URL
 
-QUOTE_FONT = "Kitab"
-BOOK_FONT = "KFGQPC Uthman Taha Naskh"
-GREEN = (11, 74, 49)
-GRAY = (110, 110, 110)
-DARK_RED = (178, 34, 34)
+DEFAULT_JSON_DIR = Path(sq.config_str(BOOKS_CFG, "json_dir", "data/books/json"))
+DEFAULT_DOCX_DIR = Path(sq.config_str(BOOKS_CFG, "docx_dir", "data/books/docx"))
+DEFAULT_CATALOG_FILE = Path(
+    sq.config_str(BOOKS_CFG, "catalog_file", "data/books/catalog.json"))
+
+QUOTE_FONT = sq.config_str(BOOKS_CFG, "quran_font", sq.DEFAULT_QURAN_FONT)
+BOOK_FONT = sq.config_str(BOOKS_CFG, "book_font", sq.DEFAULT_TAFSIR_FONT)
+BOOK_COLORS = BOOKS_CFG.get("colors")
+if not isinstance(BOOK_COLORS, dict):
+    BOOK_COLORS = {}
+GREEN = sq.config_rgb(BOOK_COLORS, "green", "0B4A31")
+GRAY = sq.config_rgb(BOOK_COLORS, "gray", "6E6E6E")
+DARK_RED = sq.config_rgb(BOOK_COLORS, "dark_red", "B22222")
 
 CATEGORY_CACHE: Dict[str, str] = {}
 
@@ -83,7 +92,7 @@ def clean_text(value: Any) -> str:
     return re.sub(r"\s+", " ", str(value).replace("\xa0", " ")).strip()
 
 
-MAX_NAME_LENGTH = 100
+MAX_NAME_LENGTH = sq.config_int(BOOKS_CFG, "max_name_length", 100)
 
 
 def safe_name(value: str) -> str:
@@ -879,7 +888,7 @@ def parse_book_landing(html: str, book_id: str, url: str,
         "related_books": parse_related_books(soup, url),
         "source_url": url,
         "source_index": BOOKS_INDEX,
-        "sitemap_url": BOOK_SITEMAP.format(book_id),
+        "sitemap_url": BOOK_SITEMAP.format(book_id=book_id),
         "site_version": body_attrs.get("data-v", ""),
         "body_attrs": body_attrs,
         "raw_json_ld": ld,
@@ -944,7 +953,7 @@ def parse_part_page(html: str, book_id: str, number: int, url: str,
         "part_stem": part_stem(number, total_parts),
         "title": clean_text(title_el.get_text(" ", strip=True)) if title_el else "",
         "source_url": url,
-        "source_sitemap": BOOK_SITEMAP.format(book_id),
+        "source_sitemap": BOOK_SITEMAP.format(book_id=book_id),
         "body_attrs": dict(body.attrs) if body else {},
         "page_count": len(pages),
         "block_count": sum(p["block_count"] for p in pages),
@@ -990,7 +999,8 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
         "name": category_name,
     }
     category_dir = category_dir_name(category, args.category_style)
-    landing_url = entry.get("cards", [{}])[0].get("url") or f"{BASE}/books/{book_id}/index.html"
+    landing_url = (entry.get("cards", [{}])[0].get("url")
+                   or sq.BOOKS_BOOK_INDEX_URL.format(book_id=book_id))
 
     existing_path = find_meta_path(args.json_dir, book_id)
     meta = json_read(existing_path) if existing_path else None
@@ -1030,7 +1040,7 @@ def scrape_book(book_id: str, catalog: Dict[str, Any], args: argparse.Namespace)
 
     try:
         sitemap_xml = sq.fetch_text(
-            BOOK_SITEMAP.format(book_id), retries=args.retries,
+            BOOK_SITEMAP.format(book_id=book_id), retries=args.retries,
             timeout=args.timeout, delay=args.delay)
     except Exception as exc:
         print(f"[error] {book_id}: cannot fetch sitemap: {exc}", file=sys.stderr)

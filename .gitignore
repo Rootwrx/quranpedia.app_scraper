@@ -5,3 +5,4 @@
 !requirements.txt
 !scrape_quranpedia.py
 !scrape_books.py
+!config.json

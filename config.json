@@ -1,0 +1,112 @@
+{
+  "site": {
+    "base_url": "https://quranpedia.app",
+    "user_agent": "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)"
+  },
+  "urls": {
+    "sitemap_index": "{base}/sitemap.xml",
+    "quran_data": "{base}/assets/quran-data.js",
+    "quran_text": "{base}/assets/quran-text.js",
+    "tafseer_index": "{base}/tafseer/index.html",
+    "uloom_index": "{base}/uloom/index.html",
+    "books_index": "{base}/books/index.html",
+    "books_sitemap_index": "{base}/sitemap.xml",
+    "books_book_sitemap": "{base}/sitemap-books-{book_id}.xml",
+    "books_book_index": "{base}/books/{book_id}/index.html",
+    "book_sitemap": "{base}/sitemap-{slug}.xml",
+    "book_index": "{base}/{source}/{slug}/index.html",
+    "book_ayah_page": "{base}/{source}/{slug}/sura{s}-aya{a}.html",
+    "book_source_dir": "{base}/{source}/{slug}/",
+    "uloom_word_index": "{base}/uloom/{slug}/index.html",
+    "uloom_word_page": "{base}/uloom/{slug}/w/{key}.html",
+    "uloom_data": "{base}/uloom/_d/{surah}-{ayah}.js",
+    "uloom_word_entry": "{base}/uloom/_r/{slug}/{key}.js"
+  },
+  "sources": {
+    "tafseer": "tafseer",
+    "uloom": "uloom"
+  },
+  "files": {
+    "catalog_tafseer": "catalog-tafseer.json",
+    "catalog_uloom": "catalog-uloom.json",
+    "quran_data": "quran-data.json",
+    "quran_text": "quran-text.json",
+    "fetch_cache": "fetch-cache.json",
+    "word_headwords": "headwords.json"
+  },
+  "catalog": {
+    "default_category_name": "غير مصنف",
+    "method_other": {
+      "slug": "method-other",
+      "name": "غير محدد المنهج"
+    },
+    "coverage_full": {
+      "slug": "coverage-full",
+      "name": "كامل"
+    },
+    "coverage_partial": {
+      "slug": "coverage-partial",
+      "name": "سور وآيات منه"
+    },
+    "coverage_other": {
+      "slug": "coverage-unspecified",
+      "name": "غير محدد التغطية"
+    }
+  },
+  "uloom": {
+    "word_slugs": [
+      "raghib",
+      "umdah",
+      "ishtiqaqi",
+      "maqayees",
+      "sihah",
+      "lisan",
+      "qamoos",
+      "tamyeez",
+      "jothur"
+    ],
+    "word_to_html": {
+      "ٗ": "ࣰ",
+      "ٞ": "ࣱ",
+      "ٖ": "ࣲ"
+    }
+  },
+  "parsing": {
+    "block_text_classes": ["bh", "bl", "bx", "ba", "bz", "fb", "fi"],
+    "block_tags": ["p", "div", "li", "blockquote", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6"]
+  },
+  "docx": {
+    "page_color": "F3EEE2",
+    "quran_color": "0F6B9C",
+    "t1_color": "B22222",
+    "page_number_color": "FF0000",
+    "heading_styles": {
+      "surah": "Surah Heading",
+      "verse": "Verse Heading",
+      "tafsir": "Tafsir Heading"
+    }
+  },
+  "books": {
+    "json_dir": "data/books/json",
+    "docx_dir": "data/books/docx",
+    "catalog_file": "data/books/catalog.json",
+    "book_font": "KFGQPC Uthman Taha Naskh",
+    "quran_font": "Kitab",
+    "colors": {
+      "green": "0B4A31",
+      "gray": "6E6E6E",
+      "dark_red": "B22222"
+    },
+    "max_name_length": 100
+  },
+  "defaults": {
+    "workers": 12,
+    "retries": 3,
+    "timeout": 30,
+    "tafsir_font": "KFGQPC Uthman Taha Naskh",
+    "quran_font": "Kitab",
+    "quran_classes": ["qa", "qr", "t3"],
+    "font_size": 16.0,
+    "line_spacing": 1.0
+  }
+}

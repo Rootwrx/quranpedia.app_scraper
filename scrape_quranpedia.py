@@ -43,6 +43,9 @@ Usage examples
 
   --book is a repeatable alias for --books; --tafsirs is a legacy alias.
 
+  User-editable lists and defaults are in config.json next to this script.
+  Set QURANPEDIA_CONFIG to load another config file.
+
 Dependencies: requests, beautifulsoup4, lxml, python-docx
 """
 
@@ -50,6 +53,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import sys
 import threading
@@ -86,76 +90,153 @@ except ImportError:  # DOCX support is optional at scrape time
     Document = None
 
 
-BASE = "https://quranpedia.app"
-SITEMAP_INDEX = f"{BASE}/sitemap.xml"
-QURAN_DATA_JS = f"{BASE}/assets/quran-data.js"
-QURAN_TEXT_JS = f"{BASE}/assets/quran-text.js"
-TAFSEER_INDEX = f"{BASE}/tafseer/index.html"
-ULOOM_INDEX = f"{BASE}/uloom/index.html"
-SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
-DEFAULT_CATEGORY_NAME = "غير مصنف"
-METHOD_OTHER_SLUG = "method-other"
-METHOD_OTHER_NAME = "غير محدد المنهج"
-COVERAGE_FULL_SLUG = "coverage-full"
-COVERAGE_PARTIAL_SLUG = "coverage-partial"
-COVERAGE_OTHER_SLUG = "coverage-unspecified"
-COVERAGE_OTHER_NAME = "غير محدد التغطية"
-
-# These uloom books are word/root dictionaries: their sitemaps list /w/*.html
-# entries, not suraN-ayaM.html pages. Their sura*.html URLs exist but are just
-# Baghawy tafsir pages, so they must not be fed to the ayah-based pipeline.
-ULOOM_WORD_SLUGS = frozenset({
-    "raghib", "umdah", "ishtiqaqi", "maqayees", "sihah", "lisan",
-    "qamoos", "tamyeez", "jothur",
-})
-
-# Optional structured uloom source: one QU(...) payload per ayah. These files
-# change when book text changes, so they are fetched fresh and never cached.
-ULOOM_DATA_URL = BASE + "/uloom/_d/{surah}-{ayah}.js"
-
-# Word dictionaries are headword books. Their QU ayah payload only lists which
-# roots occur in an ayah; the entry body itself lives in static QR(...) files.
-ULOOM_WORD_R_URL = BASE + "/uloom/_r/{slug}/{key}.js"
-WORD_HEADWORDS_FILE = "headwords.json"
-
-# The QU word list uses different combining marks for tanween than the HTML
-# ayah element. Translate them so --from-data ayah_text matches HTML mode.
-ULOOM_WORD_TO_HTML = {"ٗ": "ࣰ", "ٞ": "ࣱ", "ٖ": "ࣲ"}
-
-USER_AGENT = "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)"
-
-# Word renders Latin tokens (Al-Faatiha, 1:1, URLs) correctly only when they are
-# in their own non-RTL runs. Brackets/quotes stay in the surrounding RTL run.
-LTR_TOKEN_RE = re.compile(
-    r"[A-Za-z0-9](?:[A-Za-z0-9@._\-/:+%,–]|[ ](?=[A-Za-z0-9]))*"
+# User-editable configuration. Anything a maintainer may reasonably change
+# without reading the scraper lives in config.json next to this script.
+CONFIG_PATH = Path(
+    os.environ.get("QURANPEDIA_CONFIG")
+    or Path(__file__).with_name("config.json")
 )
-_RUN_SPECIAL_RE = re.compile(r"[\t\r\n]")
 
-# QuranPedia uses inline <span> elements that are display:block in style.css.
-# Treating them as line boundaries is essential: turath-hadir puts headings,
-# bullet lines, the closing box, and the whole footnote block in such spans,
-# so a text-only walker otherwise glues them to neighbouring paragraphs.
-BLOCK_TEXT_CLASSES = frozenset({
-    "bh",  # بين يدي السورة heading
-    "bl",  # bullet/list line
-    "bx",  # closing callout box
-    "ba",  # centered ayah banner
-    "bz",  # signature line
-    "fb",  # footnote block
-    "fi",  # one footnote item
-})
-BLOCK_TAGS = frozenset({
-    "p", "div", "li", "blockquote", "ul", "ol",
-    "h1", "h2", "h3", "h4", "h5", "h6",
-})
+DEFAULT_CONFIG = {
+    "site": {
+        "base_url": "https://quranpedia.app",
+        "user_agent": "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)",
+    },
+    "urls": {
+        "sitemap_index": "{base}/sitemap.xml",
+        "quran_data": "{base}/assets/quran-data.js",
+        "quran_text": "{base}/assets/quran-text.js",
+        "tafseer_index": "{base}/tafseer/index.html",
+        "uloom_index": "{base}/uloom/index.html",
+        "books_index": "{base}/books/index.html",
+        "books_sitemap_index": "{base}/sitemap.xml",
+        "books_book_sitemap": "{base}/sitemap-books-{book_id}.xml",
+        "books_book_index": "{base}/books/{book_id}/index.html",
+        "book_sitemap": "{base}/sitemap-{slug}.xml",
+        "book_index": "{base}/{source}/{slug}/index.html",
+        "book_ayah_page": "{base}/{source}/{slug}/sura{s}-aya{a}.html",
+        "book_source_dir": "{base}/{source}/{slug}/",
+        "uloom_word_index": "{base}/uloom/{slug}/index.html",
+        "uloom_word_page": "{base}/uloom/{slug}/w/{key}.html",
+        "uloom_data": "{base}/uloom/_d/{surah}-{ayah}.js",
+        "uloom_word_entry": "{base}/uloom/_r/{slug}/{key}.js",
+    },
+    "sources": {"tafseer": "tafseer", "uloom": "uloom"},
+    "files": {
+        "catalog_tafseer": "catalog-tafseer.json",
+        "catalog_uloom": "catalog-uloom.json",
+        "quran_data": "quran-data.json",
+        "quran_text": "quran-text.json",
+        "fetch_cache": "fetch-cache.json",
+        "word_headwords": "headwords.json",
+    },
+    "catalog": {
+        "default_category_name": "غير مصنف",
+        "method_other": {"slug": "method-other", "name": "غير محدد المنهج"},
+        "coverage_full": {"slug": "coverage-full", "name": "كامل"},
+        "coverage_partial": {"slug": "coverage-partial", "name": "سور وآيات منه"},
+        "coverage_other": {"slug": "coverage-unspecified", "name": "غير محدد التغطية"},
+    },
+    "uloom": {
+        "word_slugs": [
+            "raghib", "umdah", "ishtiqaqi", "maqayees", "sihah",
+            "lisan", "qamoos", "tamyeez", "jothur",
+        ],
+        "word_to_html": {"ٗ": "ࣰ", "ٞ": "ࣱ", "ٖ": "ࣲ"},
+    },
+    "parsing": {
+        "block_text_classes": ["bh", "bl", "bx", "ba", "bz", "fb", "fi"],
+        "block_tags": [
+            "p", "div", "li", "blockquote", "ul", "ol",
+            "h1", "h2", "h3", "h4", "h5", "h6",
+        ],
+    },
+    "docx": {
+        "page_color": "F3EEE2",
+        "quran_color": "0F6B9C",
+        "t1_color": "B22222",
+        "page_number_color": "FF0000",
+        "heading_styles": {
+            "surah": "Surah Heading",
+            "verse": "Verse Heading",
+            "tafsir": "Tafsir Heading",
+        },
+    },
+    "books": {
+        "json_dir": "data/books/json",
+        "docx_dir": "data/books/docx",
+        "catalog_file": "data/books/catalog.json",
+        "book_font": "KFGQPC Uthman Taha Naskh",
+        "quran_font": "Kitab",
+        "colors": {"green": "0B4A31", "gray": "6E6E6E", "dark_red": "B22222"},
+        "max_name_length": 100,
+    },
+    "defaults": {
+        "workers": 12,
+        "retries": 3,
+        "timeout": 30,
+        "tafsir_font": "KFGQPC Uthman Taha Naskh",
+        "quran_font": "Kitab",
+        "quran_classes": ["qa", "qr", "t3"],
+        "font_size": 16.0,
+        "line_spacing": 1.0,
+    },
+}
 
-PAGE_COLOR = "F3EEE2"            # warm parchment page background
-QURAN_COLOR = (0x0F, 0x6B, 0x9C)  # #0F6B9C verse text
-T1_COLOR = "B22222"              # dark red for t1 spans (not necessarily Quran)
-PAGE_NUMBER_COLOR = (0xFF, 0x00, 0x00)  # red footer page number
-SURAH_HEADING_STYLE = "Surah Heading"   # outline level 0
-VERSE_HEADING_STYLE = "Verse Heading"   # outline level 1
-TAFSIR_HEADING_STYLE = "Tafsir Heading"  # outline level 2 (combined DOCX)
+
+def _merge_config(base: dict, override: dict) -> dict:
+    merged = dict(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _merge_config(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def load_runtime_config(path: Path) -> dict:
+    """Load config.json, falling back to built-in defaults if it is broken."""
+    try:
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return deepcopy(DEFAULT_CONFIG)
+    except (OSError, ValueError) as exc:
+        print(f"[warn] cannot load config {path}: {exc}; using built-in defaults",
+              file=sys.stderr)
+        return deepcopy(DEFAULT_CONFIG)
+    if not isinstance(loaded, dict):
+        print(f"[warn] config {path} must contain a JSON object; using defaults",
+              file=sys.stderr)
+        return deepcopy(DEFAULT_CONFIG)
+    return _merge_config(deepcopy(DEFAULT_CONFIG), loaded)
+
+
+CFG = load_runtime_config(CONFIG_PATH)
+
+
+def _section(name: str) -> dict:
+    value = CFG.get(name)
+    return value if isinstance(value, dict) and value else DEFAULT_CONFIG[name]
+
+
+def _cfg_url(key: str) -> str:
+    return str(_section("urls").get(key, DEFAULT_CONFIG["urls"][key]))
+
+
+CFG_SITE = _section("site")
+CFG_FILES = _section("files")
+CFG_CATALOG = _section("catalog")
+CFG_ULOOM = _section("uloom")
+CFG_PARSING = _section("parsing")
+CFG_DOCX = _section("docx")
+CFG_DEFAULTS = _section("defaults")
+
+
+def hex_to_rgb(value: str) -> Tuple[int, int, int]:
+    text = str(value).strip().lstrip("#")
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        return (0, 0, 0)
+    return tuple(int(text[i:i + 2], 16) for i in (0, 2, 4))
 
 
 def parse_hex_color(value: str) -> str:
@@ -166,9 +247,217 @@ def parse_hex_color(value: str) -> str:
     return text.upper()
 
 
-def hex_to_rgb(value: str) -> Tuple[int, int, int]:
-    return tuple(int(value[i:i + 2], 16) for i in (0, 2, 4))
+def _cfg_color(key: str, fallback: str) -> str:
+    return _color_text(CFG_DOCX, key, fallback)
 
+
+def _cfg_str(section: dict, key: str, fallback: str) -> str:
+    value = section.get(key, fallback)
+    return str(value) if value is not None else str(fallback)
+
+
+def _cfg_list(section: dict, key: str, fallback: list) -> list:
+    value = section.get(key, fallback)
+    return [str(item) for item in value] if isinstance(value, list) else list(fallback)
+
+
+def _cfg_map(section: dict, key: str, fallback: dict) -> dict:
+    value = section.get(key)
+    return value if isinstance(value, dict) else fallback
+
+
+def _cfg_int(section: dict, key: str, fallback: int) -> int:
+    value = section.get(key, fallback)
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        print(f"[warn] config {key!r} must be an integer; using {fallback}",
+              file=sys.stderr)
+        return fallback
+
+
+def _cfg_float(section: dict, key: str, fallback: float) -> float:
+    value = section.get(key, fallback)
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        print(f"[warn] config {key!r} must be a number; using {fallback}",
+              file=sys.stderr)
+        return fallback
+
+
+def _color_text(section: dict, key: str, fallback: str) -> str:
+    value = section.get(key, fallback)
+    text = str(fallback) if value is None else str(value).strip().lstrip("#").upper()
+    if not re.fullmatch(r"[0-9A-Fa-f]{6}", text):
+        print(f"[warn] config {key!r} must be RRGGBB or #RRGGBB; using {fallback}",
+              file=sys.stderr)
+        return str(fallback).upper()
+    return text
+
+
+def _cfg_rgb(section: dict, key: str, fallback: str) -> Tuple[int, int, int]:
+    return hex_to_rgb(_color_text(section, key, fallback))
+
+
+BASE = _cfg_str(CFG_SITE, "base_url", "https://quranpedia.app").rstrip("/")
+USER_AGENT = _cfg_str(
+    CFG_SITE, "user_agent",
+    "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)")
+
+
+def _url(template_key: str, **values) -> str:
+    template = _cfg_url(template_key)
+    try:
+        return template.replace("{base}", BASE).format(**values)
+    except (IndexError, KeyError, ValueError) as exc:
+        print(f"[warn] config URL {template_key!r} is invalid ({exc}); "
+              "using built-in default", file=sys.stderr)
+        return DEFAULT_CONFIG["urls"][template_key].replace("{base}", BASE).format(**values)
+
+
+# Public config helpers so sibling scripts use the same file and validation.
+def config_section(name: str) -> dict:
+    return _section(name)
+
+
+def config_url(template_key: str, **values) -> str:
+    return _url(template_key, **values)
+
+
+def config_str(section: dict, key: str, fallback: str) -> str:
+    return _cfg_str(section, key, fallback)
+
+
+def config_int(section: dict, key: str, fallback: int) -> int:
+    return _cfg_int(section, key, fallback)
+
+
+def config_float(section: dict, key: str, fallback: float) -> float:
+    return _cfg_float(section, key, fallback)
+
+
+def config_rgb(section: dict, key: str, fallback: str) -> Tuple[int, int, int]:
+    return _cfg_rgb(section, key, fallback)
+
+
+SITEMAP_INDEX = _url("sitemap_index")
+QURAN_DATA_JS = _url("quran_data")
+QURAN_TEXT_JS = _url("quran_text")
+TAFSEER_INDEX = _url("tafseer_index")
+ULOOM_INDEX = _url("uloom_index")
+BOOKS_INDEX_URL = _url("books_index")
+BOOKS_SITEMAP_INDEX_URL = _url("books_sitemap_index")
+BOOKS_BOOK_SITEMAP_URL = _url("books_book_sitemap", book_id="{book_id}")
+BOOKS_BOOK_INDEX_URL = _url("books_book_index", book_id="{book_id}")
+BOOK_SITEMAP_URL = _url("book_sitemap", slug="{slug}")
+BOOK_INDEX_URL = _url("book_index", source="{source}", slug="{slug}")
+ULOOM_WORD_INDEX_URL = _url("uloom_word_index", slug="{slug}")
+ULOOM_WORD_PAGE_URL = _url("uloom_word_page", slug="{slug}", key="{key}")
+BOOK_AYAH_URL = _url(
+    "book_ayah_page", source="{source}", slug="{slug}", s="{s}", a="{a}")
+BOOK_SOURCE_DIR_URL = _url("book_source_dir", source="{source}", slug="{slug}")
+
+SOURCE_PATHS = {
+    str(k): str(v) for k, v in _section("sources").items()
+}
+
+
+def book_index_url(path: str, slug: str) -> str:
+    return BOOK_INDEX_URL.format(source=path, slug=slug)
+
+
+def book_sitemap_url(slug: str) -> str:
+    return BOOK_SITEMAP_URL.format(slug=slug)
+
+
+def uloom_word_index_url(slug: str) -> str:
+    return ULOOM_WORD_INDEX_URL.format(slug=slug)
+
+
+def uloom_word_page_url(slug: str, key: str) -> str:
+    return ULOOM_WORD_PAGE_URL.format(slug=slug, key=key)
+
+
+def book_ayah_url(path: str, slug: str, surah, ayah) -> str:
+    return BOOK_AYAH_URL.format(
+        source=path, slug=slug, s=surah, a=ayah)
+
+
+def book_source_url(path: str, slug: str) -> str:
+    return BOOK_SOURCE_DIR_URL.format(source=path, slug=slug)
+
+
+CATALOG_TAFSEER_FILE = _cfg_str(CFG_FILES, "catalog_tafseer", "catalog-tafseer.json")
+CATALOG_ULOOM_FILE = _cfg_str(CFG_FILES, "catalog_uloom", "catalog-uloom.json")
+QURAN_DATA_FILE = _cfg_str(CFG_FILES, "quran_data", "quran-data.json")
+QURAN_TEXT_FILE = _cfg_str(CFG_FILES, "quran_text", "quran-text.json")
+FETCH_CACHE_NAME = _cfg_str(CFG_FILES, "fetch_cache", "fetch-cache.json")
+WORD_HEADWORDS_FILE = _cfg_str(CFG_FILES, "word_headwords", "headwords.json")
+
+DEFAULT_CATEGORY_NAME = _cfg_str(
+    CFG_CATALOG, "default_category_name", "غير مصنف")
+METHOD_OTHER = _cfg_map(CFG_CATALOG, "method_other", DEFAULT_CONFIG["catalog"]["method_other"])
+COVERAGE_FULL = _cfg_map(CFG_CATALOG, "coverage_full", DEFAULT_CONFIG["catalog"]["coverage_full"])
+COVERAGE_PARTIAL = _cfg_map(CFG_CATALOG, "coverage_partial", DEFAULT_CONFIG["catalog"]["coverage_partial"])
+COVERAGE_OTHER = _cfg_map(CFG_CATALOG, "coverage_other", DEFAULT_CONFIG["catalog"]["coverage_other"])
+METHOD_OTHER_SLUG = _cfg_str(METHOD_OTHER, "slug", "method-other")
+METHOD_OTHER_NAME = _cfg_str(METHOD_OTHER, "name", "غير محدد المنهج")
+COVERAGE_FULL_SLUG = _cfg_str(COVERAGE_FULL, "slug", "coverage-full")
+COVERAGE_PARTIAL_SLUG = _cfg_str(COVERAGE_PARTIAL, "slug", "coverage-partial")
+COVERAGE_OTHER_SLUG = _cfg_str(COVERAGE_OTHER, "slug", "coverage-unspecified")
+COVERAGE_OTHER_NAME = _cfg_str(COVERAGE_OTHER, "name", "غير محدد التغطية")
+
+# Word/root dictionary slugs are configurable in config.json. Their sitemaps
+# list /w/*.html entries; their sura*.html URLs are Baghawy tafsir pages.
+ULOOM_WORD_SLUGS = frozenset(_cfg_list(CFG_ULOOM, "word_slugs", [
+    "raghib", "umdah", "ishtiqaqi", "maqayees", "sihah",
+    "lisan", "qamoos", "tamyeez", "jothur",
+]))
+
+# QU ayah payloads and QR word-entry bodies. These URLs are static enough to
+# configure; the QU files themselves still change with the book text.
+ULOOM_DATA_URL = _url("uloom_data", surah="{surah}", ayah="{ayah}")
+ULOOM_WORD_R_URL = _url("uloom_word_entry", slug="{slug}", key="{key}")
+
+# The QU word list uses different combining marks for tanween than the HTML
+# ayah element. Translate them so --from-data ayah_text matches HTML mode.
+word_to_html = CFG_ULOOM.get("word_to_html")
+ULOOM_WORD_TO_HTML = {
+    str(k): str(v) for k, v in word_to_html.items()
+} if isinstance(word_to_html, dict) else {"ٗ": "ࣰ", "ٞ": "ࣱ", "ٖ": "ࣲ"}
+
+# Word renders Latin tokens (Al-Faatiha, 1:1, URLs) correctly only when they are
+# in their own non-RTL runs. Brackets/quotes stay in the surrounding RTL run.
+LTR_TOKEN_RE = re.compile(
+    r"[A-Za-z0-9](?:[A-Za-z0-9@._\-/:+%,–]|[ ](?=[A-Za-z0-9]))*"
+)
+_RUN_SPECIAL_RE = re.compile(r"[\t\r\n]")
+
+BLOCK_TEXT_CLASSES = frozenset(_cfg_list(
+    CFG_PARSING, "block_text_classes", ["bh", "bl", "bx", "ba", "bz", "fb", "fi"]))
+BLOCK_TAGS = frozenset(_cfg_list(
+    CFG_PARSING, "block_tags",
+    ["p", "div", "li", "blockquote", "ul", "ol", "h1", "h2", "h3", "h4", "h5", "h6"]))
+
+PAGE_COLOR = _cfg_color("page_color", "F3EEE2")
+QURAN_COLOR = hex_to_rgb(_cfg_color("quran_color", "0F6B9C"))
+T1_COLOR = _cfg_color("t1_color", "B22222")
+PAGE_NUMBER_COLOR = hex_to_rgb(_cfg_color("page_number_color", "FF0000"))
+HEADING_STYLES = _cfg_map(
+    CFG_DOCX, "heading_styles", DEFAULT_CONFIG["docx"]["heading_styles"])
+SURAH_HEADING_STYLE = _cfg_str(HEADING_STYLES, "surah", "Surah Heading")
+VERSE_HEADING_STYLE = _cfg_str(HEADING_STYLES, "verse", "Verse Heading")
+TAFSIR_HEADING_STYLE = _cfg_str(HEADING_STYLES, "tafsir", "Tafsir Heading")
+
+DEFAULT_WORKERS = _cfg_int(CFG_DEFAULTS, "workers", 12)
+DEFAULT_RETRIES = _cfg_int(CFG_DEFAULTS, "retries", 3)
+DEFAULT_TIMEOUT = _cfg_int(CFG_DEFAULTS, "timeout", 30)
+DEFAULT_TAFSIR_FONT = _cfg_str(CFG_DEFAULTS, "tafsir_font", "KFGQPC Uthman Taha Naskh")
+DEFAULT_QURAN_FONT = _cfg_str(CFG_DEFAULTS, "quran_font", "Kitab")
+DEFAULT_QURAN_CLASSES = _cfg_list(CFG_DEFAULTS, "quran_classes", ["qa", "qr", "t3"])
+DEFAULT_FONT_SIZE = _cfg_float(CFG_DEFAULTS, "font_size", 16.0)
+DEFAULT_LINE_SPACING = _cfg_float(CFG_DEFAULTS, "line_spacing", 1.0)
 
 T1_RGB = hex_to_rgb(T1_COLOR)
 
@@ -438,7 +727,7 @@ def _build_uloom_catalog(soup) -> dict:
                 "categories": [],
                 "path_categories": [],
                 "cards": [],
-                "source": f"{BASE}/uloom/{slug}/index.html",
+                "source": uloom_word_index_url(slug),
             }
             books[slug] = entry
         return entry
@@ -531,7 +820,7 @@ def _build_uloom_catalog(soup) -> dict:
             "field_category": field_cat["slug"],
             "creed": creed,
             "coverage_category": coverage_cat["slug"],
-            "url": f"{BASE}/uloom/{slug}/index.html",
+            "url": uloom_word_index_url(slug),
             "label": clean_label(title_el.get_text(" ", strip=True)) if title_el else "",
         })
 
@@ -689,7 +978,7 @@ def build_catalog(source: str, names: Dict[str, str], *,
                 "categories": [],
                 "path_categories": [],
                 "cards": [],
-                "source": f"{BASE}/tafseer/{slug}/index.html",
+                "source": book_index_url(SOURCE_PATHS["tafseer"], slug),
             }
             books[slug] = entry
         return entry
@@ -817,7 +1106,7 @@ def build_catalog(source: str, names: Dict[str, str], *,
                 "coverage": raw_coverage,
                 "method_category": method_cat["slug"],
                 "coverage_category": coverage_cat["slug"],
-                "url": f"{BASE}/tafseer/{book_slug}/index.html",
+                "url": book_index_url(SOURCE_PATHS["tafseer"], book_slug),
                 "label": clean_label(title_el.get_text(" ", strip=True)) if title_el else "",
                 "shelf": "popular" if not primary_era else "era",
             })
@@ -911,7 +1200,9 @@ def catalog_path(args: argparse.Namespace, source: str) -> Path:
     custom = getattr(args, "catalog_file", None)
     if custom is not None:
         return Path(custom)
-    return Path(args.json_dir) / f"catalog-{source}.json"
+    filename = (CATALOG_ULOOM_FILE if source == "uloom"
+                else CATALOG_TAFSEER_FILE)
+    return Path(args.json_dir) / filename
 
 
 def save_catalog(path: Path, catalog: dict) -> None:
@@ -1160,9 +1451,9 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
         "fields": fields,
         "coverages": coverages,
         "catalog_entry": catalog_entry,
-        "source": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
-        "source_index": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
-        "sitemap": f"{BASE}/sitemap-{slug}.xml",
+        "source": book_index_url(SOURCE_PATHS[source], slug),
+        "source_index": book_index_url(SOURCE_PATHS[source], slug),
+        "sitemap": book_sitemap_url(slug),
         "surah_count": len(surah_numbers),
         "surah_numbers": surah_numbers,
         "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1195,7 +1486,7 @@ def load_quran_data() -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
 def load_quran_data_cached(json_dir: Path, refresh: bool = False
                            ) -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
     """load_quran_data() with a saved copy in <json-dir>/quran-data.json."""
-    path = json_dir / "quran-data.json"
+    path = json_dir / QURAN_DATA_FILE
     saved = json_read(path)
     if saved and saved.get("surahs") and not refresh:
         return (saved["surahs"], dict(saved.get("names", {})),
@@ -1225,7 +1516,7 @@ def load_hizb_markers(json_dir: Path, surah_meta: List[dict],
     marker list to reproduce HTML-mode ayah_text exactly. The marker list is
     cached locally; quran-text.js itself changes rarely.
     """
-    path = json_dir / "quran-text.json"
+    path = json_dir / QURAN_TEXT_FILE
     saved = json_read(path)
     if saved and "ayahs" in saved and not refresh:
         return {(int(s), int(a)) for s, a in saved["ayahs"]}
@@ -1259,9 +1550,6 @@ def load_hizb_markers(json_dir: Path, surah_meta: List[dict],
     return markers
 
 
-FETCH_CACHE_NAME = "fetch-cache.json"
-
-
 def load_fetch_cache(book_dir: Path) -> dict:
     """Per-book saved discovery data: book info + sitemap page list."""
     return json_read(book_dir / FETCH_CACHE_NAME) or {}
@@ -1278,7 +1566,8 @@ def save_fetch_cache(book_dir: Path, cache: dict) -> None:
 def sitemap_to_cache(slug: str, source: str,
                      urls: Dict[Tuple[int, int], str]) -> dict:
     """Compact form: ayah numbers per surah plus a URL template when regular."""
-    template = f"{BASE}/{SOURCE_PATHS[source]}/{slug}/sura{{s}}-aya{{a}}.html"
+    template = BOOK_AYAH_URL.format(
+        source=SOURCE_PATHS[source], slug=slug, s="{s}", a="{a}")
     if all(u == template.format(s=s, a=a) for (s, a), u in urls.items()):
         surahs: Dict[str, List[int]] = {}
         for s, a in sorted(urls):
@@ -1328,7 +1617,7 @@ def get_book_meta(slug: str, names: Dict[str, str],
         "methods": catalog_entry.get("methods", []),
         "fields": catalog_entry.get("fields", []),
         "coverages": catalog_entry.get("coverages", []),
-        "source": f"{BASE}/{path}/{slug}/index.html",
+        "source": book_index_url(path, slug),
     }
     try:
         html = fetch_text(meta["source"])
@@ -1376,7 +1665,7 @@ def catalog_book_meta(slug: str, names: Dict[str, str], source: str,
         "methods": catalog_entry.get("methods", []),
         "fields": catalog_entry.get("fields", []),
         "coverages": catalog_entry.get("coverages", []),
-        "source": f"{BASE}/{path}/{slug}/index.html",
+        "source": book_index_url(path, slug),
     }
     if source == "uloom" and slug in ULOOM_WORD_SLUGS:
         meta["kind"] = "word"
@@ -1390,7 +1679,7 @@ def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
 
 def get_ayah_urls(slug: str) -> Dict[Tuple[int, int], str]:
     """Parse sitemap-<slug>.xml into {(surah, ayah): url}."""
-    xml = fetch_text(f"{BASE}/sitemap-{slug}.xml")
+    xml = fetch_text(book_sitemap_url(slug))
     urls: Dict[Tuple[int, int], str] = {}
     for loc in re.findall(r"<loc>(.*?)</loc>", xml):
         m = re.search(r"sura(\d+)-aya(\d+)\.html", loc)
@@ -1412,8 +1701,8 @@ def synthetic_uloom_data_urls(slug: str, surahs: List[int],
     for surah in surahs:
         count = int((surah_meta_by_number.get(surah) or {}).get("ayah_count", 0) or 0)
         for ayah in range(1, count + 1):
-            urls[(surah, ayah)] = (
-                f"{BASE}/uloom/{slug}/sura{surah}-aya{ayah}.html")
+            urls[(surah, ayah)] = book_ayah_url(
+                SOURCE_PATHS["uloom"], slug, surah, ayah)
     return urls
 
 
@@ -1699,14 +1988,14 @@ def get_word_entry_list(slug: str, book_dir: Path, *, refresh: bool,
                  str(item[2]) if len(item) > 2 else "")
                 for item in saved]
 
-    xml = fetch_text(f"{BASE}/sitemap-{slug}.xml", retries=retries,
+    xml = fetch_text(book_sitemap_url(slug), retries=retries,
                      timeout=timeout, delay=delay)
     page_urls = [loc for loc in re.findall(r"<loc>(.*?)</loc>", xml)
                  if "/w/" in loc]
     if not page_urls:
         raise ValueError(f"no /w/ entries in sitemap-{slug}.xml")
 
-    index_html = fetch_text(f"{BASE}/uloom/{slug}/index.html",
+    index_html = fetch_text(uloom_word_index_url(slug),
                             retries=retries, timeout=timeout, delay=delay)
     index_soup = BeautifulSoup(index_html, "lxml")
     labels: Dict[str, str] = {}
@@ -1782,7 +2071,7 @@ def scrape_word_entries(slug: str, entries: List[Tuple[str, str, str]],
         "kind": "word",
         "slug": slug,
         "book": tafsir_meta,
-        "source_index": f"{BASE}/uloom/{slug}/index.html",
+        "source_index": uloom_word_index_url(slug),
         "entry_count": len(ordered),
         "total_entries": len(entries),
         "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
@@ -1914,11 +2203,11 @@ def write_surah_json(slug: str, surah: int, results: Dict[Tuple[int, int], dict]
     payload = {
         "tafsir": tafsir_meta,
         "surah": surah_meta,
-        "source_index": f"{BASE}/{path}/{slug}/index.html",
+        "source_index": book_index_url(path, slug),
         "ayah_count": len(results),
         "ayahs": [results[k] for k in sorted(results)],
     }
-    payload["source_url"] = f"{BASE}/{path}/{slug}/"
+    payload["source_url"] = book_source_url(path, slug)
     payload["scraped_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
     tmp = out_path.with_suffix(".json.tmp")
     tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -3369,9 +3658,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="limit ayahs per surah while scraping (0 = no limit)")
     p.add_argument("--max-entries", type=int, default=0,
                    help="limit headwords for word dictionaries (0 = no limit)")
-    p.add_argument("--workers", type=int, default=12, help="concurrent requests (default: 12)")
-    p.add_argument("--retries", type=int, default=3)
-    p.add_argument("--timeout", type=int, default=30)
+    p.add_argument("--workers", type=int, default=DEFAULT_WORKERS,
+                   help=f"concurrent requests (default: {DEFAULT_WORKERS})")
+    p.add_argument("--retries", type=int, default=DEFAULT_RETRIES)
+    p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--delay", type=float, default=0.0,
                    help="delay before each request, seconds")
     p.add_argument("--force", action="store_true", help="re-scrape existing surah JSON")
@@ -3397,24 +3687,27 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="in scrape mode, require the saved catalog and never fetch "
                         "the source index (error if missing); by default a saved "
                         "catalog is already used automatically")
-    p.add_argument("--tafsir-font", default="KFGQPC Uthman Taha Naskh",
-                   help="font for tafsir text (default: KFGQPC Uthman Taha Naskh)")
+    p.add_argument("--tafsir-font", default=DEFAULT_TAFSIR_FONT,
+                   help=f"font for tafsir text (default: {DEFAULT_TAFSIR_FONT})")
     p.add_argument("--font", dest="tafsir_font", help=argparse.SUPPRESS)  # backwards-compatible alias
-    p.add_argument("--quran-font", default="Kitab",
-                   help="font for ayah text and Quran quotes inside tafsir (default: Kitab)")
-    p.add_argument("--quran-classes", default="qa,qr,t3",
-                   help="tafsir span classes rendered with the Quran font (default: qa,qr,t3)")
-    p.add_argument("--font-size", type=float, default=16.0,
-                   help="tafsir DOCX font size (default: 16)")
+    p.add_argument("--quran-font", default=DEFAULT_QURAN_FONT,
+                   help=f"font for ayah text and Quran quotes (default: {DEFAULT_QURAN_FONT})")
+    p.add_argument("--quran-classes", default=",".join(DEFAULT_QURAN_CLASSES),
+                   help="tafsir span classes rendered with the Quran font "
+                        f"(default: {','.join(DEFAULT_QURAN_CLASSES)})")
+    p.add_argument("--font-size", type=float, default=DEFAULT_FONT_SIZE,
+                   help=f"tafsir DOCX font size (default: {DEFAULT_FONT_SIZE:g})")
     p.add_argument("--page-color", type=parse_hex_color, default=PAGE_COLOR,
-                   help="DOCX page background color, #RRGGBB (default: #F3EEE2)")
-    p.add_argument("--quran-color", type=parse_hex_color, default="0F6B9C",
-                   help="ayah verse color, #RRGGBB (default: #0F6B9C)")
+                   help=f"DOCX page background color, #RRGGBB (default: #{PAGE_COLOR})")
+    quran_hex = _cfg_color("quran_color", "0F6B9C")
+    p.add_argument("--quran-color", type=parse_hex_color, default=quran_hex,
+                   help=f"ayah verse color, #RRGGBB (default: #{quran_hex})")
     p.add_argument("--t1-color", type=parse_hex_color, default=T1_COLOR,
-                   help="t1 span color, #RRGGBB (default: #B22222 dark red; "
+                   help=f"t1 span color, #RRGGBB (default: #{T1_COLOR}; "
                         "use #FF4500 for orangered)")
-    p.add_argument("--line-spacing", type=float, default=1.0,
-                   help="paragraph line spacing multiplier (default: 1.0)")
+    p.add_argument("--line-spacing", type=float, default=DEFAULT_LINE_SPACING,
+                   help="paragraph line spacing multiplier "
+                        f"(default: {DEFAULT_LINE_SPACING:g})")
     p.add_argument("--bold-tafsir", action="store_true", dest="bold_tafsir",
                    help="bold tafsir text (default: not bold)")
     p.add_argument("--no-bold", action="store_false", dest="bold_tafsir",
