@@ -31,8 +31,8 @@ Usage examples
   python scrape_quranpedia.py --uloom --tafsirs nashr --full
   python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
 
-  # everything, 12 workers
-  python scrape_quranpedia.py --tafsirs all --full --workers 12
+  # everything, 12 workers (reuse the saved catalog on repeat runs)
+  python scrape_quranpedia.py --tafsirs all --full --workers 12 --use-local-catalog
 
 Dependencies: requests, beautifulsoup4, lxml, python-docx
 """
@@ -43,6 +43,7 @@ import argparse
 import json
 import re
 import sys
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -51,6 +52,13 @@ from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, NavigableString
+
+try:
+    import requests
+    from requests.adapters import HTTPAdapter
+except ImportError:  # keep the urllib fallback if requests is unavailable
+    requests = None
+    HTTPAdapter = None
 
 try:
     from docx import Document
@@ -117,13 +125,46 @@ T1_RGB = hex_to_rgb(T1_COLOR)
 # --------------------------------------------------------------------------- #
 # HTTP helpers
 # --------------------------------------------------------------------------- #
+_SESSION_LOCAL = threading.local()
+_HTTP_POOL_SIZE = 32
+
+
+def get_session():
+    """Return a thread-local requests.Session with connection pooling."""
+    if requests is None:
+        return None
+    session = getattr(_SESSION_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        adapter = HTTPAdapter(
+            pool_connections=_HTTP_POOL_SIZE,
+            pool_maxsize=_HTTP_POOL_SIZE,
+            max_retries=0,
+        )
+        session.mount("http://", adapter)
+        session.mount("https://", adapter)
+        _SESSION_LOCAL.session = session
+    return session
+
+
+def configure_http_pool(workers: int) -> None:
+    global _HTTP_POOL_SIZE
+    _HTTP_POOL_SIZE = max(8, workers + 4)
+
+
 def fetch_bytes(url: str, retries: int = 3, timeout: int = 30, delay: float = 0.0) -> bytes:
-    """Fetch a URL with retries and a small polite delay."""
+    """Fetch a URL with retries, keep-alive, and a small polite delay."""
     last: Optional[Exception] = None
     for attempt in range(retries):
         try:
             if delay:
                 time.sleep(delay)
+            session = get_session()
+            if session is not None:
+                response = session.get(
+                    url, headers={"User-Agent": USER_AGENT}, timeout=timeout)
+                response.raise_for_status()
+                return response.content
             req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return resp.read()
@@ -136,6 +177,18 @@ def fetch_bytes(url: str, retries: int = 3, timeout: int = 30, delay: float = 0.
 
 def fetch_text(url: str, **kwargs) -> str:
     return fetch_bytes(url, **kwargs).decode("utf-8", "ignore")
+
+
+def format_duration(seconds: float) -> str:
+    """Human-readable elapsed/ETA duration."""
+    total = max(0, int(seconds))
+    hours, rem = divmod(total, 3600)
+    minutes, secs = divmod(rem, 60)
+    if hours:
+        return f"{hours}h{minutes:02d}m{secs:02d}s"
+    if minutes:
+        return f"{minutes}m{secs:02d}s"
+    return f"{secs}s"
 
 
 # --------------------------------------------------------------------------- #
@@ -887,45 +940,19 @@ def parse_ayah_page(html: str, slug: str, surah: int, ayah: int, url: str,
     return item
 
 
-def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
-                 tafsir_meta: dict, surah_meta: dict, out_dir: Path, args,
-                 source: str = "tafseer") -> Path:
-    """Scrape one surah into the resolved book directory as suraNNN.json."""
-    out_dir.mkdir(parents=True, exist_ok=True)
+def fetch_and_parse_ayah(url: str, slug: str, surah: int, ayah: int, args) -> dict:
+    """Fetch and parse one ayah entirely inside a worker thread."""
+    html = fetch_text(url, retries=args.retries, timeout=args.timeout,
+                      delay=args.delay)
+    return parse_ayah_page(html, slug, surah, ayah, url,
+                           args.include_html, args.styled)
+
+
+def write_surah_json(slug: str, surah: int, results: Dict[Tuple[int, int], dict],
+                     tafsir_meta: dict, surah_meta: dict, out_dir: Path,
+                     source: str) -> Path:
+    """Atomically write one surah payload from collected ayah results."""
     out_path = out_dir / f"sura{surah:03d}.json"
-    if out_path.exists() and not args.force:
-        print(f"[skip] {slug} surah {surah}: {out_path} exists")
-        return out_path
-
-    pairs = sorted(key for key in ayah_urls if key[0] == surah)
-    if args.max_ayahs:
-        pairs = pairs[: args.max_ayahs]
-    if not pairs:
-        print(f"[warn] {slug} surah {surah}: no pages in sitemap", file=sys.stderr)
-        return out_path
-
-    results: Dict[Tuple[int, int], dict] = {}
-    with ThreadPoolExecutor(max_workers=args.workers) as pool:
-        futures = {
-            pool.submit(
-                fetch_text,
-                ayah_urls[(s, a)],
-                retries=args.retries,
-                timeout=args.timeout,
-                delay=args.delay,
-            ): (s, a)
-            for s, a in pairs
-        }
-        for fut in as_completed(futures):
-            s, a = futures[fut]
-            try:
-                results[(s, a)] = parse_ayah_page(
-                    fut.result(), slug, s, a, ayah_urls[(s, a)],
-                    args.include_html, args.styled,
-                )
-            except Exception as exc:  # noqa: BLE001
-                print(f"[error] {slug} {s}:{a}: {exc}", file=sys.stderr)
-
     path = SOURCE_PATHS[source]
     payload = {
         "tafsir": tafsir_meta,
@@ -941,6 +968,110 @@ def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
     tmp.replace(out_path)
     print(f"[ok]   {slug} surah {surah}: {len(results)} ayahs -> {out_path}")
     return out_path
+
+
+def scrape_surahs(slug: str, surahs: List[int],
+                  ayah_urls: Dict[Tuple[int, int], str],
+                  tafsir_meta: dict, surah_meta_by_number: Dict[int, dict],
+                  out_dir: Path, args, source: str = "tafseer") -> Dict[int, Path]:
+    """Scrape several surahs with one shared fetch pool and live progress.
+
+    Instead of opening a new ThreadPoolExecutor for every surah, all ayah pages
+    for the requested surahs are queued at once. A surah JSON is written as soon
+    as its last ayah finishes, so interrupted runs stay resumable.
+    """
+    out_dir.mkdir(parents=True, exist_ok=True)
+    jobs: Dict[Tuple[int, int], str] = {}
+    expected: Dict[int, int] = {}
+    written: Dict[int, Path] = {}
+
+    for surah in surahs:
+        out_path = out_dir / f"sura{surah:03d}.json"
+        if out_path.exists() and not args.force:
+            print(f"[skip] {slug} surah {surah}: {out_path} exists")
+            written[surah] = out_path
+            continue
+        pairs = sorted(key for key in ayah_urls if key[0] == surah)
+        if args.max_ayahs:
+            pairs = pairs[: args.max_ayahs]
+        if not pairs:
+            print(f"[warn] {slug} surah {surah}: no pages in sitemap", file=sys.stderr)
+            written[surah] = out_path
+            continue
+        expected[surah] = len(pairs)
+        for pair in pairs:
+            jobs[pair] = ayah_urls[pair]
+
+    if not jobs:
+        for surah in surahs:
+            written.setdefault(surah, out_dir / f"sura{surah:03d}.json")
+        return written
+
+    results_by_surah: Dict[int, Dict[Tuple[int, int], dict]] = {
+        s: {} for s in expected}
+    completed_by_surah: Dict[int, int] = {s: 0 for s in expected}
+    total = len(jobs)
+    done = 0
+    start = time.monotonic()
+    last_report = start
+    every = max(25, total // 50)
+    progress_lock = threading.Lock()
+
+    def emit_progress(final: bool = False) -> None:
+        nonlocal last_report
+        with progress_lock:
+            snapshot = done
+            now = time.monotonic()
+            if not final and now - last_report < 5 and snapshot % every:
+                return
+            last_report = now
+        elapsed = max(now - start, 0.001)
+        rate = snapshot / elapsed
+        eta = (total - snapshot) / rate if rate else 0.0
+        print(f"[progress] {slug}: {snapshot}/{total} ayahs "
+              f"({snapshot / total:.0%}) elapsed {format_duration(elapsed)} "
+              f"eta {format_duration(eta)}", flush=True)
+
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {
+            pool.submit(
+                fetch_and_parse_ayah, url, slug, surah, ayah, args,
+            ): (surah, ayah)
+            for (surah, ayah), url in jobs.items()
+        }
+        for fut in as_completed(futures):
+            surah, ayah = futures[fut]
+            pair = (surah, ayah)
+            try:
+                results_by_surah[surah][pair] = fut.result()
+            except Exception as exc:  # noqa: BLE001
+                print(f"[error] {slug} {surah}:{ayah}: {exc}", file=sys.stderr)
+            completed_by_surah[surah] += 1
+            with progress_lock:
+                done += 1
+            emit_progress()
+            if completed_by_surah[surah] == expected[surah]:
+                written[surah] = write_surah_json(
+                    slug, surah, results_by_surah[surah], tafsir_meta,
+                    surah_meta_by_number.get(surah, {"number": surah}),
+                    out_dir, source,
+                )
+                results_by_surah.pop(surah, None)
+
+    emit_progress(final=True)
+    for surah in surahs:
+        written.setdefault(surah, out_dir / f"sura{surah:03d}.json")
+    return written
+
+
+def scrape_surah(slug: str, surah: int, ayah_urls: Dict[Tuple[int, int], str],
+                 tafsir_meta: dict, surah_meta: dict, out_dir: Path, args,
+                 source: str = "tafseer") -> Path:
+    """Backward-compatible single-surah wrapper around scrape_surahs()."""
+    return scrape_surahs(
+        slug, [surah], ayah_urls, tafsir_meta, {surah: surah_meta},
+        out_dir, args, source=source,
+    )[surah]
 
 
 def write_full_json(slug: str, book_dir: Path, *,
@@ -1982,7 +2113,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help=argparse.SUPPRESS)  # backwards-compatible alias
     p.add_argument("--max-ayahs", type=int, default=0,
                    help="limit ayahs per surah while scraping (0 = no limit)")
-    p.add_argument("--workers", type=int, default=6, help="concurrent requests (default: 6)")
+    p.add_argument("--workers", type=int, default=12, help="concurrent requests (default: 12)")
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--timeout", type=int, default=30)
     p.add_argument("--delay", type=float, default=0.0,
@@ -1999,6 +2130,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--docx-dir", type=Path, default=Path("data/docx"))
     p.add_argument("--catalog-file", type=Path, default=None,
                    help="category catalog path (default: <json-dir>/catalog-<source>.json)")
+    p.add_argument("--use-local-catalog", action="store_true",
+                   help="in scrape mode, reuse the saved catalog instead of fetching "
+                        "the source index (requires an existing catalog)")
     p.add_argument("--tafsir-font", default="KFGQPC Uthman Taha Naskh",
                    help="font for tafsir text (default: KFGQPC Uthman Taha Naskh)")
     p.add_argument("--font", dest="tafsir_font", help=argparse.SUPPRESS)  # backwards-compatible alias
@@ -2025,6 +2159,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--include-source", action="store_true",
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
+    if args.workers < 1:
+        print("[error] --workers must be at least 1", file=sys.stderr)
+        return 2
+    configure_http_pool(args.workers)
 
     def split_values(values: Iterable[str]) -> List[str]:
         return [part.strip() for raw in values
@@ -2070,11 +2208,19 @@ def main(argv: Optional[List[str]] = None) -> int:
     surah_meta: List[dict] = []
 
     if source == "tafseer":
-        if build_only:
+        if build_only or args.use_local_catalog:
             catalog = load_local_catalog(cat_path)
             if not catalog:
-                print(f"[warn] no local tafsir catalog at {cat_path}; "
-                      f"using legacy <slug> folders", file=sys.stderr)
+                if build_only:
+                    print(f"[warn] no local tafsir catalog at {cat_path}; "
+                          f"using legacy <slug> folders", file=sys.stderr)
+                else:
+                    print(f"[error] --use-local-catalog needs an existing catalog at "
+                          f"{cat_path}; run one scrape without it first",
+                          file=sys.stderr)
+                    return 1
+            if not build_only:
+                surah_meta, names, _short = load_quran_data()
         else:
             surah_meta, names, _short = load_quran_data()
             catalog = build_catalog(
@@ -2186,6 +2332,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         return 1 if combined_errors else 0
 
     any_error = False
+    surah_meta_by_number = {int(m.get("number", 0)): m for m in surah_meta}
     for slug in slugs:
         json_root = args.json_dir
         json_book, docx_book = resolve_book_paths(
@@ -2250,10 +2397,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             any_error = True
             continue
 
-        for s in surahs_for_slug:
-            sm = next((x for x in surah_meta if x["number"] == s), {"number": s})
-            scrape_surah(slug, s, urls, tafsir_meta, sm, json_book, args,
-                         source=source)
+        scrape_surahs(slug, surahs_for_slug, urls, tafsir_meta,
+                      surah_meta_by_number, json_book, args, source=source)
         if full_mode and not args.no_full_json:
             try:
                 full_path = write_full_json(

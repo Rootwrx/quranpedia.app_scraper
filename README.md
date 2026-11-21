@@ -179,7 +179,8 @@ Verified samples include `b373` (1 bab, 5 printed pages), `b11728` (107 abwab,
 Three explicit operations:
 
 - **Default (no flag): scrape only.** Reads surah names from `quran-data.js`,
-  reads the sitemap, downloads ayah pages concurrently, and writes JSON.
+  reads the sitemap, downloads ayah pages concurrently with one shared pool per
+  book (keep-alive connections, live progress/ETA), and writes JSON.
 - **`--docx`: build DOCX only.** No network calls at all; builds purely from
   per-surah JSON already on disk. (`--no-json` is a hidden alias.) Missing JSON
   or a locked output file produces an `[error]` and a non-zero exit code.
@@ -194,6 +195,13 @@ either source.
 Tafsir selection supports `--tafsirs slug1,slug2`, `--all`, repeatable
 `--category` values, and the `--method` / `--coverage` facet filters. `--source`
 still selects tafseer vs. uloom; the category and facet filters are tafsir-only.
+
+Scraping defaults to 12 workers. All surahs for a book share one fetch queue,
+so every worker stays busy even when a surah is small. Repeat runs can add
+`--use-local-catalog` to skip re-fetching the tafsir index and reuse
+`data/json/catalog-tafseer.json`; it errors if no saved catalog exists. Raising
+`--workers` above 12 rarely helps because the site throttles requests; lower it
+if you see rate-limit errors.
 
 All three operations support the same two scopes:
 
@@ -329,11 +337,14 @@ python scrape_quranpedia.py --method lugha --coverage partial --full --docx
 python scrape_quranpedia.py --all --full --docx
 
 # full mode: scrape everything, then build everything separately
-python scrape_quranpedia.py --tafsirs katheer --full --workers 8
+python scrape_quranpedia.py --tafsirs katheer --full
 python scrape_quranpedia.py --tafsirs katheer --full --docx
 
+# repeat/full runs: reuse the saved catalog and every worker across all surahs
+python scrape_quranpedia.py --tafsirs tabary --full --workers 12 --use-local-catalog
+
 # all 71 tafsirs (large: ~318k pages, tens of GB of HTML)
-python scrape_quranpedia.py --tafsirs all --full --workers 8
+python scrape_quranpedia.py --tafsirs all --full --workers 12
 python scrape_quranpedia.py --tafsirs all --full --docx
 
 # uloom al-Quran: same pipeline, different index
