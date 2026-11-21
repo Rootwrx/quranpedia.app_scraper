@@ -249,7 +249,9 @@ DOCX details:
   whatever metadata is available: tafsir name, book, author, death year
   (`سنة الوفاة`), surah number and ayah count (or surah count for the full volume),
   mushaf page, scrape date, and source URL. A page break separates the cover from
-  the content.
+  the content. Values already shown as the title/subtitle are not repeated as
+  detail rows, and the first content page no longer repeats the tafsir/book/author
+  header from the cover.
 - **Collapsible Word outline:** surah headings use outline level 0, every ayah
   verse heading uses outline level 1, and combined-DOCX tafsir headings use
   outline level 2. Verses and individual tafsirs appear in Word's Navigation

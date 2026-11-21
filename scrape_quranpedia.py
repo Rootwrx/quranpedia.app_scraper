@@ -1770,34 +1770,42 @@ def add_cover_page(doc, data: dict, surah_nums: List[int], full_quran: bool,
         )
 
     details: List[Tuple[str, str]] = []
-    book = meta.get("book", "")
-    if book:
-        details.append(("الكتاب", book))
-    author = meta.get("author", "")
-    if author:
-        details.append(("المؤلف", author))
+    # The title/subtitle above already show the tafsir name. Some books (e.g.
+    # turath-hadir) use the same value for meta.name and meta.book, so printing
+    # "الكتاب" as well makes the cover look duplicated.
+    shown = {str(title).strip(), str(subtitle).strip()}
+    detail_keys = set()
+
+    def add_detail(label: str, value) -> None:
+        text = str(value).strip() if value else ""
+        key = (label, text)
+        # Only title/subtitle repeats are suppressed. Different labels may share
+        # a value (e.g. رقم السورة: 1 and صفحة المصحف: 1).
+        if not text or text in shown or key in detail_keys:
+            return
+        detail_keys.add(key)
+        details.append((label, text))
+
+    add_detail("الكتاب", meta.get("book", ""))
+    add_detail("المؤلف", meta.get("author", ""))
     death = meta.get("death_hijri")
     if death:
-        details.append(("سنة الوفاة", f"{death} هـ"))
+        add_detail("سنة الوفاة", f"{death} هـ")
 
     if full_quran:
         if surah_nums:
-            details.append(("عدد السور", str(len(surah_nums))))
+            add_detail("عدد السور", str(len(surah_nums)))
     else:
         if surah_meta.get("number"):
-            details.append(("رقم السورة", str(surah_meta["number"])))
+            add_detail("رقم السورة", str(surah_meta["number"]))
         ayah_count = data.get("ayah_count") or len(data.get("ayahs", []))
         if ayah_count:
-            details.append(("عدد الآيات", str(ayah_count)))
+            add_detail("عدد الآيات", str(ayah_count))
         if surah_meta.get("page"):
-            details.append(("صفحة المصحف", str(surah_meta["page"])))
+            add_detail("صفحة المصحف", str(surah_meta["page"]))
 
-    scraped_at = data.get("scraped_at")
-    if scraped_at:
-        details.append(("تاريخ الجمع", scraped_at))
-    source = data.get("source_index") or meta.get("source", "")
-    if source:
-        details.append(("المصدر", source))
+    add_detail("تاريخ الجمع", data.get("scraped_at"))
+    add_detail("المصدر", data.get("source_index") or meta.get("source", ""))
 
     for label, value in details:
         add_paragraph(
@@ -1839,7 +1847,7 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
     for surah_nums, path in groups:
         doc = Document()
         style_document(doc, font_name, font_size, page_color)
-        meta = None
+        written = False
 
         cover_data = None
         for s in surah_nums:
@@ -1862,11 +1870,13 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
             if idx > 0:
                 doc.add_page_break()
             data = json.loads(json_path.read_text(encoding="utf-8"))
-            meta = data.get("tafsir", {})
+            written = True
             sm = data.get("surah", {})
+            # The cover already carries the tafsir/book/author metadata. Repeating
+            # it here made page 2 look like a second cover page.
             add_paragraph(
                 doc,
-                f"سورة {sm.get('name_ar', s)} — {meta.get('name', slug)}",
+                f"سورة {sm.get('name_ar', s)}",
                 size=font_size + 6,
                 bold=True,
                 color=(11, 74, 49),
@@ -1875,15 +1885,6 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                 space_after=4,
                 style=doc.styles[SURAH_HEADING_STYLE],
                 outline_level=0,
-            )
-            add_paragraph(
-                doc,
-                meta.get("book", "") + (f" — {meta.get('author')}" if meta.get("author") else ""),
-                size=font_size,
-                bold=bold,
-                font_name=font_name,
-                line_spacing=line_spacing,
-                space_after=4,
             )
 
             for item in data.get("ayahs", []):
@@ -1907,7 +1908,7 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
                     t1_color=t1_color, include_source=include_source,
                 )
 
-        if meta is None:
+        if not written:
             print(f"[error] no data for {path}", file=sys.stderr)
             continue
         path.parent.mkdir(parents=True, exist_ok=True)
