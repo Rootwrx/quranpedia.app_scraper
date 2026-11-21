@@ -48,6 +48,7 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from copy import deepcopy
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Tuple
 
@@ -1483,15 +1484,30 @@ def style_document(doc, font_name: str, font_size: float, page_color: str) -> No
     add_page_number_footer(doc, font_name, font_size)
 
 
-def add_text_run(p, text: str, *, rtl: bool, font_name: Optional[str],
-                 size: float, bold: bool, color: Optional[Tuple[int, int, int]]) -> None:
-    run = p.add_run(text)
+# python-docx's schema-aware get_or_add_* helpers are extremely expensive when
+# repeated for every run (they scan successor elements on each insertion). A
+# full tabary volume creates ~580k runs, so build each distinct w:rPr once and
+# clone it instead of rebuilding the same XML millions of times.
+_RPR_CACHE: Dict[tuple, object] = {}
+_RPR_TEMPLATE_DOC = None
+_RPR_TEMPLATE_PARA = None
+
+
+def _rpr_template(*, rtl: bool, font_name: Optional[str], size: float,
+                  bold: bool, color: Optional[Tuple[int, int, int]]):
+    global _RPR_TEMPLATE_DOC, _RPR_TEMPLATE_PARA
+    key = (rtl, font_name, size, bool(bold), color)
+    cached = _RPR_CACHE.get(key)
+    if cached is not None:
+        return cached
+
+    if _RPR_TEMPLATE_DOC is None:
+        _RPR_TEMPLATE_DOC = Document()
+        _RPR_TEMPLATE_PARA = _RPR_TEMPLATE_DOC.add_paragraph()
+    run = _RPR_TEMPLATE_PARA.add_run("x")
     rpr = run._element.get_or_add_rPr()
     set_run_direction(run, rtl)
-    if bold:
-        set_rpr_bold(rpr, True)
-    else:
-        set_rpr_bold(rpr, False)
+    set_rpr_bold(rpr, bool(bold))
     clear_rpr_italic(rpr)
     if size:
         set_rpr_size(rpr, size)
@@ -1499,6 +1515,19 @@ def add_text_run(p, text: str, *, rtl: bool, font_name: Optional[str],
         run.font.color.rgb = RGBColor(*color)
     if font_name:
         set_run_font(run, font_name)
+
+    template = deepcopy(rpr)
+    run._element.getparent().remove(run._element)
+    _RPR_CACHE[key] = template
+    return template
+
+
+def add_text_run(p, text: str, *, rtl: bool, font_name: Optional[str],
+                 size: float, bold: bool, color: Optional[Tuple[int, int, int]]) -> None:
+    run = p.add_run(text)
+    run._r.insert(0, deepcopy(_rpr_template(
+        rtl=rtl, font_name=font_name, size=size, bold=bold, color=color,
+    )))
 
 
 def add_text_runs(p, text: str, *, font_name: Optional[str] = None,
