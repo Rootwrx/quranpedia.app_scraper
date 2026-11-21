@@ -1160,6 +1160,68 @@ def load_quran_data() -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
     )
 
 
+def load_quran_data_cached(json_dir: Path, refresh: bool = False
+                           ) -> Tuple[List[dict], Dict[str, str], Dict[str, str]]:
+    """load_quran_data() with a saved copy in <json-dir>/quran-data.json."""
+    path = json_dir / "quran-data.json"
+    saved = json_read(path)
+    if saved and saved.get("surahs") and not refresh:
+        return (saved["surahs"], dict(saved.get("names", {})),
+                dict(saved.get("short", {})))
+    try:
+        surahs, names, short = load_quran_data()
+    except Exception as exc:  # noqa: BLE001
+        if saved and saved.get("surahs"):
+            print(f"[warn] cannot refresh surah data ({exc}); using saved copy",
+                  file=sys.stderr)
+            return (saved["surahs"], dict(saved.get("names", {})),
+                    dict(saved.get("short", {})))
+        raise
+    try:
+        json_write(path, {"surahs": surahs, "names": names, "short": short,
+                          "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S%z")})
+    except OSError as exc:
+        print(f"[warn] cannot save {path}: {exc}", file=sys.stderr)
+    return surahs, names, short
+
+
+FETCH_CACHE_NAME = "fetch-cache.json"
+
+
+def load_fetch_cache(book_dir: Path) -> dict:
+    """Per-book saved discovery data: book info + sitemap page list."""
+    return json_read(book_dir / FETCH_CACHE_NAME) or {}
+
+
+def save_fetch_cache(book_dir: Path, cache: dict) -> None:
+    cache["cached_at"] = time.strftime("%Y-%m-%dT%H:%M:%S%z")
+    try:
+        json_write(book_dir / FETCH_CACHE_NAME, cache)
+    except OSError as exc:
+        print(f"[warn] cannot save fetch cache in {book_dir}: {exc}", file=sys.stderr)
+
+
+def sitemap_to_cache(slug: str, source: str,
+                     urls: Dict[Tuple[int, int], str]) -> dict:
+    """Compact form: ayah numbers per surah plus a URL template when regular."""
+    template = f"{BASE}/{SOURCE_PATHS[source]}/{slug}/sura{{s}}-aya{{a}}.html"
+    if all(u == template.format(s=s, a=a) for (s, a), u in urls.items()):
+        surahs: Dict[str, List[int]] = {}
+        for s, a in sorted(urls):
+            surahs.setdefault(str(s), []).append(a)
+        return {"template": template, "surahs": surahs}
+    return {"urls": [[s, a, u] for (s, a), u in sorted(urls.items())]}
+
+
+def sitemap_from_cache(entry: Optional[dict]) -> Dict[Tuple[int, int], str]:
+    if not entry:
+        return {}
+    if "template" in entry:
+        return {(int(s), int(a)): entry["template"].format(s=int(s), a=int(a))
+                for s, ayahs in entry.get("surahs", {}).items() for a in ayahs}
+    return {(int(s), int(a)): u for s, a, u in entry.get("urls", [])}
+
+
 def get_all_slugs(source: str = "tafseer") -> List[str]:
     """Read book slugs from the tafseer or uloom index page."""
     index_url = TAFSEER_INDEX if source == "tafseer" else ULOOM_INDEX
@@ -1174,7 +1236,8 @@ def get_all_tafsir_slugs() -> List[str]:
 
 def get_book_meta(slug: str, names: Dict[str, str],
                   source: str = "tafseer",
-                  catalog_entry: Optional[dict] = None) -> dict:
+                  catalog_entry: Optional[dict] = None,
+                  report: Optional[dict] = None) -> dict:
     """Read book metadata from a tafseer/uloom index page JSON-LD block."""
     path = SOURCE_PATHS[source]
     catalog_entry = catalog_entry or {}
@@ -1210,6 +1273,8 @@ def get_book_meta(slug: str, names: Dict[str, str],
         death = re.search(r"\((\d+)\s*-\s*(\d+)\s*هـ\)|ت\s*(\d+)\s*هـ", html)
         if death and not catalog_entry.get("death_hijri"):
             meta["death_hijri"] = int(death.group(2) or death.group(3) or 0)
+        if report is not None:
+            report["ok"] = True  # the live page was fetched and parsed
     except Exception:  # noqa: BLE001 - metadata is best-effort
         pass
     return meta
@@ -1494,21 +1559,44 @@ def scrape_surahs(slug: str, surahs: List[int],
     expected: Dict[int, int] = {}
     written: Dict[int, Path] = {}
 
+    existing_by_surah: Dict[int, Dict[Tuple[int, int], dict]] = {}
     for surah in surahs:
         out_path = out_dir / f"sura{surah:03d}.json"
-        if out_path.exists() and not args.force:
-            print(f"[skip] {slug} surah {surah}: {out_path} exists")
-            written[surah] = out_path
-            continue
         pairs = sorted(key for key in ayah_urls if key[0] == surah)
         if args.max_ayahs:
             pairs = pairs[: args.max_ayahs]
+        saved = json_read(out_path) if (out_path.exists() and not args.force) else None
         if not pairs:
-            print(f"[warn] {slug} surah {surah}: no pages in sitemap", file=sys.stderr)
+            if saved is not None:
+                print(f"[skip] {slug} surah {surah}: {out_path} exists")
+            else:
+                print(f"[warn] {slug} surah {surah}: no pages in sitemap",
+                      file=sys.stderr)
             written[surah] = out_path
             continue
-        expected[surah] = len(pairs)
-        for pair in pairs:
+        have: Dict[Tuple[int, int], dict] = {}
+        if saved is not None:
+            for item in saved.get("ayahs", []):
+                try:
+                    s_txt, a_txt = str(item.get("key", "")).split(":")
+                    have[(int(s_txt), int(a_txt))] = item
+                except ValueError:
+                    continue
+        missing = [pair for pair in pairs if pair not in have]
+        if saved is not None and not missing:
+            print(f"[skip] {slug} surah {surah}: complete "
+                  f"({len(pairs)} ayahs saved) {out_path}")
+            written[surah] = out_path
+            continue
+        if have:
+            print(f"[resume] {slug} surah {surah}: {len(missing)} of {len(pairs)} "
+                  f"ayahs missing; fetching only those")
+            existing_by_surah[surah] = have
+        elif out_path.exists() and not args.force:
+            print(f"[warn] {slug} surah {surah}: saved file unreadable or empty; "
+                  f"re-fetching it", file=sys.stderr)
+        expected[surah] = len(missing)
+        for pair in missing:
             jobs[pair] = ayah_urls[pair]
 
     if not jobs:
@@ -1517,8 +1605,9 @@ def scrape_surahs(slug: str, surahs: List[int],
         return written
 
     results_by_surah: Dict[int, Dict[Tuple[int, int], dict]] = {
-        s: {} for s in expected}
+        s: dict(existing_by_surah.get(s, {})) for s in expected}
     completed_by_surah: Dict[int, int] = {s: 0 for s in expected}
+    failed_by_surah: Dict[int, int] = {s: 0 for s in expected}
     total = len(jobs)
     done = 0
     start = time.monotonic()
@@ -1557,6 +1646,7 @@ def scrape_surahs(slug: str, surahs: List[int],
                 results_by_surah[surah][pair] = fut.result()
             except Exception as exc:  # noqa: BLE001
                 print(f"[error] {slug} {surah}:{ayah}: {exc}", file=sys.stderr)
+                failed_by_surah[surah] += 1
                 if _STATS is not None:
                     _STATS.count_failure()
             completed_by_surah[surah] += 1
@@ -1564,6 +1654,11 @@ def scrape_surahs(slug: str, surahs: List[int],
                 done += 1
             emit_progress()
             if completed_by_surah[surah] == expected[surah]:
+                if failed_by_surah[surah]:
+                    print(f"[warn] {slug} surah {surah}: {failed_by_surah[surah]} "
+                          f"ayah(s) failed and are missing from the file; rerun the "
+                          f"same command (without --force) to fetch only those",
+                          file=sys.stderr)
                 written[surah] = write_surah_json(
                     slug, surah, results_by_surah[surah], tafsir_meta,
                     surah_meta_by_number.get(surah, {"number": surah}),
@@ -2773,6 +2868,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--delay", type=float, default=0.0,
                    help="delay before each request, seconds")
     p.add_argument("--force", action="store_true", help="re-scrape existing surah JSON")
+    p.add_argument("--refresh", action="store_true",
+                   help="re-download discovery data (book catalog, surah list, "
+                        "book info, sitemaps) instead of using the saved copies; "
+                        "--force is separate and re-fetches ayah pages")
     p.add_argument("--stats", action="store_true",
                    help="print where scrape time goes (fetch vs parse, retries, "
                         "worker utilisation); useful for tuning --workers")
@@ -2788,8 +2887,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--catalog-file", type=Path, default=None,
                    help="category catalog path (default: <json-dir>/catalog-<source>.json)")
     p.add_argument("--use-local-catalog", action="store_true",
-                   help="in scrape mode, reuse the saved catalog instead of fetching "
-                        "the source index (requires an existing catalog)")
+                   help="in scrape mode, require the saved catalog and never fetch "
+                        "the source index (error if missing); by default a saved "
+                        "catalog is already used automatically")
     p.add_argument("--tafsir-font", default="KFGQPC Uthman Taha Naskh",
                    help="font for tafsir text (default: KFGQPC Uthman Taha Naskh)")
     p.add_argument("--font", dest="tafsir_font", help=argparse.SUPPRESS)  # backwards-compatible alias
@@ -2878,18 +2978,33 @@ def main(argv: Optional[List[str]] = None) -> int:
                           file=sys.stderr)
                     return 1
             if not build_only:
-                surah_meta, names, _short = load_quran_data()
+                surah_meta, names, _short = load_quran_data_cached(
+                    args.json_dir, args.refresh)
         else:
-            surah_meta, names, _short = load_quran_data()
-            catalog = build_catalog(
-                source, names, retries=args.retries, timeout=args.timeout,
-                delay=args.delay)
-            try:
-                save_catalog(cat_path, catalog)
-            except OSError as exc:
-                print(f"[warn] cannot save catalog {cat_path}: {exc}", file=sys.stderr)
+            surah_meta, names, _short = load_quran_data_cached(
+                args.json_dir, args.refresh)
+            catalog = {} if args.refresh else load_local_catalog(cat_path)
+            if catalog:
+                print(f"[cache] using saved catalog {cat_path} (--refresh to update)")
+            else:
+                try:
+                    catalog = build_catalog(
+                        source, names, retries=args.retries, timeout=args.timeout,
+                        delay=args.delay)
+                except Exception as exc:  # noqa: BLE001
+                    catalog = load_local_catalog(cat_path)
+                    if not catalog:
+                        raise
+                    print(f"[warn] cannot refresh catalog ({exc}); using saved copy",
+                          file=sys.stderr)
+                else:
+                    try:
+                        save_catalog(cat_path, catalog)
+                    except OSError as exc:
+                        print(f"[warn] cannot save catalog {cat_path}: {exc}",
+                              file=sys.stderr)
     elif not build_only:
-        surah_meta, names, _short = load_quran_data()
+        surah_meta, names, _short = load_quran_data_cached(args.json_dir, args.refresh)
 
     if source == "uloom" and methods:
         print("[error] --method is available for tafsirs only", file=sys.stderr)
@@ -2926,7 +3041,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                                  book_dir=find_local_book_dir(
                                      args.json_dir, source, s, catalog))]
             else:
-                all_slugs = get_all_slugs(source)
+                saved_slugs = [] if args.refresh else sorted(catalog.get("books", {}))
+                all_slugs = saved_slugs or get_all_slugs(source)
                 slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS] \
                     if source == "uloom" else all_slugs
             if source == "uloom" and slugs:
@@ -3047,8 +3163,47 @@ def main(argv: Optional[List[str]] = None) -> int:
                     any_error = True
             continue
 
-        tafsir_meta = get_book_meta(slug, names, source, catalog_entry)
-        urls = get_ayah_urls(slug)
+        old_cache = load_fetch_cache(json_book)
+        fetch_cache = dict(old_cache)
+        cache_dirty = False
+
+        tafsir_meta = None if args.refresh else old_cache.get("tafsir_meta")
+        if tafsir_meta:
+            print(f"[cache] {slug}: book info from disk")
+        else:
+            report: dict = {}
+            tafsir_meta = get_book_meta(slug, names, source, catalog_entry,
+                                        report=report)
+            if report.get("ok"):
+                fetch_cache["tafsir_meta"] = tafsir_meta
+                cache_dirty = True
+            elif old_cache.get("tafsir_meta"):
+                print(f"[warn] {slug}: cannot refresh book info; using saved copy",
+                      file=sys.stderr)
+                tafsir_meta = old_cache["tafsir_meta"]
+
+        urls = {} if args.refresh else sitemap_from_cache(old_cache.get("sitemap"))
+        if urls:
+            print(f"[cache] {slug}: sitemap from disk ({len(urls)} pages)")
+        else:
+            try:
+                urls = get_ayah_urls(slug)
+            except Exception as exc:  # noqa: BLE001
+                urls = sitemap_from_cache(old_cache.get("sitemap"))
+                if not urls:
+                    raise
+                print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
+                      f"using saved copy", file=sys.stderr)
+            else:
+                if urls:
+                    fetch_cache["sitemap"] = sitemap_to_cache(slug, source, urls)
+                    cache_dirty = True
+        if cache_dirty:
+            try:
+                json_book.mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
+            save_fetch_cache(json_book, fetch_cache)
         surahs_for_slug = sorted({s for (s, _a) in urls}) if full_mode else surahs
         if full_mode:
             print(f"[full] {slug}: {len(surahs_for_slug)} surahs available in sitemap")
