@@ -40,9 +40,17 @@ index. The 78 uloom books split into two groups:
 - **9 word/root dictionaries** (`raghib`, `umdah`, `ishtiqaqi`, `maqayees`,
   `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are not ayah-based. Their
   sitemaps list `/w/<root>.html` entries with `.well` content. Their `sura*.html`
-  URLs are byte-identical Baghawy tafsir pages, so they are skipped with a
-  warning for `--tafsirs all` and rejected with `[error]` if named explicitly.
-  They need a separate word-entry scraper/output format.
+  URLs are byte-identical Baghawy tafsir pages, so HTML mode skips them with a
+  warning for `--tafsirs all` and rejects them with `[error]` if named
+  explicitly. The optional structured mode below handles them instead.
+- **Optional structured mode:** `--from-data` (with `--source uloom` or
+  `--uloom`) fetches `https://quranpedia.app/uloom/_d/<s>-<a>.js` instead of
+  full HTML pages. It produces the same plain-text/styled-segment JSON, adds
+  `data_url`, `source_page`, and `source_coverage`, and supports the 9 word
+  dictionaries because it does not depend on HTML sitemaps or book-info pages.
+  The QU files change when book text changes, so they are never cached; the
+  static `۞` marker list is cached in `quran-text.json`. HTML remains the
+  default, and `--from-data` is rejected for tafsirs and for `--docx`.
 
 Uloom slugs do not collide with tafsir slugs. Uloom also uses Arabic category
 folders now:
@@ -395,6 +403,9 @@ python scrape_quranpedia.py --tafsirs all --full --docx
 
 # uloom al-Quran: same pipeline, different index
 python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
+# structured QU data instead of HTML; works for word dictionaries too
+python scrape_quranpedia.py --uloom --from-data --tafsirs asbab --surahs 1-2
+python scrape_quranpedia.py --uloom --from-data --tafsirs raghib --surahs 1-2
 python scrape_quranpedia.py --uloom --tafsirs nashr --full
 python scrape_quranpedia.py --source uloom --category asbab --coverage full
 python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
@@ -466,12 +477,14 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
   page color `#F3EEE2`; ayah verses `#0F6B9C`; `t1` spans `#B22222`;
   collapsible verse/tafsir headings (Word outline levels 1/2); per-surah DOCX
   named `NNN سورة <الاسم>.docx`. ✅
-- Uloom: 69 ayah-based books reuse the current scraper via `--source uloom`;
-  the 9 word/root dictionaries are explicitly unsupported by this pipeline. ✅
-  Uloom category/Arabic folders are the next step after tafsir layout review.
+- Uloom: 69 ayah-based books reuse the current scraper via `--source uloom`.
+  The 9 word/root dictionaries are unsupported in HTML mode but work in the
+  optional `--from-data` QU mode. ✅ Uloom category/Arabic folders are the next
+  step after tafsir layout review.
 
 ## Still open (optional)
 
 - Include source URLs under every ayah in DOCX? Currently opt-in via
   `--include-source` (in combine mode, the source is repeated per tafsir).
-- A separate word/root-entry scraper + DOCX layout for the 9 uloom dictionaries.
+- A dedicated word/root-entry DOCX layout for the 9 uloom dictionaries; for now
+  `--from-data` renders their QU word lists with the normal ayah DOCX layout.

@@ -28,6 +28,8 @@ Usage examples
 
   # uloom al-Quran books use the same page structure and sitemaps
   python scrape_quranpedia.py --source uloom --tafsirs asbab,qutayba --surahs 1-2
+  # optional structured QU data source (also supports word dictionaries)
+  python scrape_quranpedia.py --uloom --from-data --tafsirs asbab --surahs 1-2
   python scrape_quranpedia.py --uloom --tafsirs nashr --full
   python scrape_quranpedia.py --source uloom --tafsirs all --full --docx
 
@@ -80,6 +82,7 @@ except ImportError:  # DOCX support is optional at scrape time
 BASE = "https://quranpedia.app"
 SITEMAP_INDEX = f"{BASE}/sitemap.xml"
 QURAN_DATA_JS = f"{BASE}/assets/quran-data.js"
+QURAN_TEXT_JS = f"{BASE}/assets/quran-text.js"
 TAFSEER_INDEX = f"{BASE}/tafseer/index.html"
 ULOOM_INDEX = f"{BASE}/uloom/index.html"
 SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
@@ -98,6 +101,14 @@ ULOOM_WORD_SLUGS = frozenset({
     "raghib", "umdah", "ishtiqaqi", "maqayees", "sihah", "lisan",
     "qamoos", "tamyeez", "jothur",
 })
+
+# Optional structured uloom source: one QU(...) payload per ayah. These files
+# change when book text changes, so they are fetched fresh and never cached.
+ULOOM_DATA_URL = BASE + "/uloom/_d/{surah}-{ayah}.js"
+
+# The QU word list uses different combining marks for tanween than the HTML
+# ayah element. Translate them so --from-data ayah_text matches HTML mode.
+ULOOM_WORD_TO_HTML = {"ٗ": "ࣰ", "ٞ": "ࣱ", "ٖ": "ࣲ"}
 
 USER_AGENT = "Mozilla/5.0 (compatible; quranpedia-scraper/1.0; +local research)"
 
@@ -1185,6 +1196,48 @@ def load_quran_data_cached(json_dir: Path, refresh: bool = False
     return surahs, names, short
 
 
+def load_hizb_markers(json_dir: Path, surah_meta: List[dict],
+                      refresh: bool = False) -> set:
+    """Return {(surah, ayah)} where the HTML ayah text begins with ۞.
+
+    QU word lists omit the rub el-hizb sign, so data mode uses this static
+    marker list to reproduce HTML-mode ayah_text exactly. The marker list is
+    cached locally; quran-text.js itself changes rarely.
+    """
+    path = json_dir / "quran-text.json"
+    saved = json_read(path)
+    if saved and "ayahs" in saved and not refresh:
+        return {(int(s), int(a)) for s, a in saved["ayahs"]}
+    try:
+        text = fetch_text(QURAN_TEXT_JS)
+        start = text.index("[")
+        verses, _end = json.JSONDecoder().raw_decode(text[start:])
+    except Exception as exc:  # noqa: BLE001
+        if saved and "ayahs" in saved:
+            print(f"[warn] cannot refresh quran text ({exc}); using saved copy",
+                  file=sys.stderr)
+            return {(int(s), int(a)) for s, a in saved["ayahs"]}
+        print(f"[warn] cannot fetch quran text ({exc}); ayah markers omitted",
+              file=sys.stderr)
+        return set()
+    markers = set()
+    index = 0
+    for entry in surah_meta:
+        surah = int(entry.get("number", 0))
+        for ayah in range(1, int(entry.get("ayah_count", 0)) + 1):
+            if index < len(verses) and str(verses[index]).lstrip().startswith("۞"):
+                markers.add((surah, ayah))
+            index += 1
+    try:
+        json_write(path, {
+            "ayahs": [[s, a] for s, a in sorted(markers)],
+            "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        })
+    except OSError as exc:
+        print(f"[warn] cannot save {path}: {exc}", file=sys.stderr)
+    return markers
+
+
 FETCH_CACHE_NAME = "fetch-cache.json"
 
 
@@ -1280,6 +1333,32 @@ def get_book_meta(slug: str, names: Dict[str, str],
     return meta
 
 
+def catalog_book_meta(slug: str, names: Dict[str, str], source: str,
+                      catalog_entry: Optional[dict] = None) -> dict:
+    """Build book metadata from the local catalog without any network access.
+
+    Used by optional uloom data mode so word dictionaries never go through the
+    HTML book-info path (which only has ayah-page metadata for normal books).
+    """
+    catalog_entry = catalog_entry or {}
+    path = SOURCE_PATHS[source]
+    return {
+        "slug": slug,
+        "name": catalog_entry.get("display_name") or names.get(slug, slug),
+        "display_name": catalog_entry.get("display_name") or names.get(slug, slug),
+        "book": catalog_entry.get("title", ""),
+        "author": catalog_entry.get("author", ""),
+        "category": catalog_entry.get("category", {}),
+        "categories": catalog_entry.get("categories", []),
+        "facets": catalog_entry.get("facets", {}),
+        "path_categories": catalog_entry.get("path_categories", []),
+        "methods": catalog_entry.get("methods", []),
+        "fields": catalog_entry.get("fields", []),
+        "coverages": catalog_entry.get("coverages", []),
+        "source": f"{BASE}/{path}/{slug}/index.html",
+    }
+
+
 def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
     """Backward-compatible wrapper for tafsir metadata."""
     return get_book_meta(slug, names, "tafseer")
@@ -1293,6 +1372,24 @@ def get_ayah_urls(slug: str) -> Dict[Tuple[int, int], str]:
         m = re.search(r"sura(\d+)-aya(\d+)\.html", loc)
         if m:
             urls[(int(m.group(1)), int(m.group(2)))] = loc
+    return urls
+
+
+def synthetic_uloom_data_urls(slug: str, surahs: List[int],
+                              surah_meta_by_number: Dict[int, dict]
+                              ) -> Dict[Tuple[int, int], str]:
+    """Build ayah keys for uloom books that have no ayah sitemap.
+
+    Structured QU payloads include entries for every ayah, so word dictionaries
+    can be discovered by scanning them. Only ayahs with non-empty text are
+    written; the generated HTML-style URL is used as the JSON source URL.
+    """
+    urls: Dict[Tuple[int, int], str] = {}
+    for surah in surahs:
+        count = int((surah_meta_by_number.get(surah) or {}).get("ayah_count", 0) or 0)
+        for ayah in range(1, count + 1):
+            urls[(surah, ayah)] = (
+                f"{BASE}/uloom/{slug}/sura{surah}-aya{ayah}.html")
     return urls
 
 
@@ -1444,6 +1541,85 @@ def _first(doc, xpath: str):
     return found[0] if found else None
 
 
+def parse_uloom_data(raw) -> tuple:
+    """Decode one `QU(s, a, texts, descs, tree, words)` payload.
+
+    The arguments are valid JSON once wrapped in an array. The file is small
+    enough to parse eagerly; no fragment is cached because the site changes
+    these files whenever the underlying book text is edited.
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    text = str(raw).strip()
+    match = re.match(r"^QU\s*\(", text)
+    if not match:
+        raise ValueError("not a uloom QU data file")
+    end = text.rfind(")")
+    if end <= match.end():
+        raise ValueError("truncated uloom QU data file")
+    args = json.loads("[" + text[match.end():end] + "]")
+    if len(args) < 6:
+        raise ValueError("uloom QU data file has too few arguments")
+    return args
+
+
+def parse_uloom_data_ayah(raw, slug: str, surah: int, ayah: int, url: str,
+                          include_html: bool, styled: bool,
+                          hizb_markers: Optional[set] = None) -> Optional[dict]:
+    """Convert one QU payload into the same JSON item shape as HTML mode.
+
+    Returns None when the selected book has no text for this ayah, which lets
+    word dictionaries enumerate every ayah without writing mostly-empty JSON.
+    """
+    args = parse_uloom_data(raw)
+    texts = args[2]
+    if not isinstance(texts, dict):
+        return None
+    html = texts.get(slug) or ""
+    if not str(html).strip():
+        return None
+    html = str(html)
+
+    if _lxml_html is None:
+        doc = BeautifulSoup(html, "lxml")
+        segments = tafsir_html_to_segments(doc)
+    else:
+        doc = _lxml_html.document_fromstring(
+            f"<div>{html}</div>", parser=_lxml_parser())
+        segments = tafsir_html_to_segments_lxml(doc)
+
+    words = args[5] if isinstance(args[5], list) else []
+    ayah_text = " ".join(str(word) for word in words)
+    for source_char, html_char in ULOOM_WORD_TO_HTML.items():
+        ayah_text = ayah_text.replace(source_char, html_char)
+    if hizb_markers and (surah, ayah) in hizb_markers:
+        ayah_text = "۞ " + ayah_text
+
+    desc = args[3].get(slug) if isinstance(args[3], dict) else None
+    if not isinstance(desc, (list, tuple)):
+        desc = []
+    page = clean_label(desc[0]) if len(desc) > 0 else ""
+    coverage = clean_label(desc[1]) if len(desc) > 1 else ""
+
+    item = {
+        "surah": surah,
+        "ayah": ayah,
+        "key": f"{surah}:{ayah}",
+        "ayah_text": ayah_text,
+        "label": coverage or f"سورة {surah} - الآية {ayah}",
+        "tafsir_text": segments_to_text(segments),
+        "source_url": url,
+        "data_url": ULOOM_DATA_URL.format(surah=surah, ayah=ayah),
+        "source_page": page,
+        "source_coverage": coverage,
+    }
+    if styled:
+        item["tafsir_segments"] = segments
+    if include_html:
+        item["tafsir_html"] = html
+    return item
+
+
 def parse_ayah_page(html, slug: str, surah: int, ayah: int, url: str,
                     include_html: bool, styled: bool) -> dict:
     """Parse one ayah page (str or UTF-8 bytes).
@@ -1522,6 +1698,22 @@ def fetch_and_parse_ayah(url: str, slug: str, surah: int, ayah: int, args) -> di
     return item
 
 
+def fetch_and_parse_uloom_data(url: str, slug: str, surah: int, ayah: int,
+                               args) -> Optional[dict]:
+    """Fetch one structured QU payload instead of its HTML ayah page."""
+    data_url = ULOOM_DATA_URL.format(surah=surah, ayah=ayah)
+    t0 = time.perf_counter()
+    raw = fetch_bytes(data_url, retries=args.retries, timeout=args.timeout,
+                      delay=args.delay)
+    t1 = time.perf_counter()
+    item = parse_uloom_data_ayah(raw, slug, surah, ayah, url,
+                                 args.include_html, args.styled,
+                                 getattr(args, "hizb_markers", None))
+    if _STATS is not None:
+        _STATS.add(t1 - t0, time.perf_counter() - t1, len(raw))
+    return item
+
+
 def write_surah_json(slug: str, surah: int, results: Dict[Tuple[int, int], dict],
                      tafsir_meta: dict, surah_meta: dict, out_dir: Path,
                      source: str) -> Path:
@@ -1547,7 +1739,8 @@ def write_surah_json(slug: str, surah: int, results: Dict[Tuple[int, int], dict]
 def scrape_surahs(slug: str, surahs: List[int],
                   ayah_urls: Dict[Tuple[int, int], str],
                   tafsir_meta: dict, surah_meta_by_number: Dict[int, dict],
-                  out_dir: Path, args, source: str = "tafseer") -> Dict[int, Path]:
+                  out_dir: Path, args, source: str = "tafseer",
+                  data_mode: bool = False) -> Dict[int, Path]:
     """Scrape several surahs with one shared fetch pool and live progress.
 
     Instead of opening a new ThreadPoolExecutor for every surah, all ayah pages
@@ -1632,10 +1825,11 @@ def scrape_surahs(slug: str, surahs: List[int],
 
     global _STATS
     _STATS = FetchStats() if getattr(args, "stats", False) else None
+    fetcher = fetch_and_parse_uloom_data if data_mode else fetch_and_parse_ayah
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
         futures = {
             pool.submit(
-                fetch_and_parse_ayah, url, slug, surah, ayah, args,
+                fetcher, url, slug, surah, ayah, args,
             ): (surah, ayah)
             for (surah, ayah), url in jobs.items()
         }
@@ -1643,7 +1837,11 @@ def scrape_surahs(slug: str, surahs: List[int],
             surah, ayah = futures[fut]
             pair = (surah, ayah)
             try:
-                results_by_surah[surah][pair] = fut.result()
+                item = fut.result()
+                # Structured data mode can enumerate ayahs the book does not
+                # actually have (word dictionaries). Skip those silently.
+                if item is not None or not data_mode:
+                    results_by_surah[surah][pair] = item
             except Exception as exc:  # noqa: BLE001
                 print(f"[error] {slug} {surah}:{ayah}: {exc}", file=sys.stderr)
                 failed_by_surah[surah] += 1
@@ -2840,6 +3038,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="book index to use: tafseer (default) or uloom")
     p.add_argument("--uloom", action="store_const", dest="source", const="uloom",
                    help="shorthand for --source uloom")
+    p.add_argument("--from-data", action="store_true",
+                   help="uloom only: scrape structured /uloom/_d/<s>-<a>.js "
+                        "payloads instead of full HTML pages (default: HTML)")
     p.add_argument("--combine",
                    help="comma-separated tafsir slugs to merge into one DOCX; "
                         "implies --docx and reads local JSON only "
@@ -2952,6 +3153,13 @@ def main(argv: Optional[List[str]] = None) -> int:
         mode = "DOCX" if build_only else "SCRAPE"
         combine_label = ""
 
+    if args.from_data and source != "uloom":
+        print("[error] --from-data is available for --source uloom only", file=sys.stderr)
+        return 2
+    if args.from_data and build_only:
+        print("[error] --from-data cannot be used with --docx/--no-json", file=sys.stderr)
+        return 2
+
     # --docx must not touch the network, so use a local 1..114 range here.
     all_numbers = list(range(1, 115))
     surahs = parse_surahs(surah_spec, all_numbers)
@@ -3006,6 +3214,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif not build_only:
         surah_meta, names, _short = load_quran_data_cached(args.json_dir, args.refresh)
 
+    args.hizb_markers = (load_hizb_markers(args.json_dir, surah_meta, args.refresh)
+                         if args.from_data else set())
+
     if source == "uloom" and methods:
         print("[error] --method is available for tafsirs only", file=sys.stderr)
         return 2
@@ -3044,7 +3255,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 saved_slugs = [] if args.refresh else sorted(catalog.get("books", {}))
                 all_slugs = saved_slugs or get_all_slugs(source)
                 slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS] \
-                    if source == "uloom" else all_slugs
+                    if source == "uloom" and not args.from_data else all_slugs
             if source == "uloom" and slugs:
                 skipped = [s for s in slugs if s in ULOOM_WORD_SLUGS]
                 if skipped:
@@ -3053,14 +3264,14 @@ def main(argv: Optional[List[str]] = None) -> int:
         else:
             slugs = explicit
 
-        if source == "uloom":
+        if source == "uloom" and not args.from_data and not build_only:
             bad = [s for s in slugs if s in ULOOM_WORD_SLUGS]
             if bad:
                 bad_explicit = [s for s in bad if s in explicit_slugs]
                 if bad_explicit:
                     print(f"[error] {', '.join(bad_explicit)}: word-based uloom book(s) "
                           f"are not supported by --source uloom; they need a "
-                          f"word-entry scraper", file=sys.stderr)
+                          f"word-entry scraper or --from-data", file=sys.stderr)
                     return 1
                 slugs = [s for s in slugs if s not in ULOOM_WORD_SLUGS]
                 if slugs:
@@ -3167,37 +3378,68 @@ def main(argv: Optional[List[str]] = None) -> int:
         fetch_cache = dict(old_cache)
         cache_dirty = False
 
-        tafsir_meta = None if args.refresh else old_cache.get("tafsir_meta")
-        if tafsir_meta:
-            print(f"[cache] {slug}: book info from disk")
-        else:
-            report: dict = {}
-            tafsir_meta = get_book_meta(slug, names, source, catalog_entry,
-                                        report=report)
-            if report.get("ok"):
-                fetch_cache["tafsir_meta"] = tafsir_meta
-                cache_dirty = True
-            elif old_cache.get("tafsir_meta"):
-                print(f"[warn] {slug}: cannot refresh book info; using saved copy",
-                      file=sys.stderr)
-                tafsir_meta = old_cache["tafsir_meta"]
-
-        urls = {} if args.refresh else sitemap_from_cache(old_cache.get("sitemap"))
-        if urls:
-            print(f"[cache] {slug}: sitemap from disk ({len(urls)} pages)")
-        else:
-            try:
-                urls = get_ayah_urls(slug)
-            except Exception as exc:  # noqa: BLE001
-                urls = sitemap_from_cache(old_cache.get("sitemap"))
-                if not urls:
-                    raise
-                print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
-                      f"using saved copy", file=sys.stderr)
+        if args.from_data:
+            # Structured data mode is local-metadata only. Word dictionaries
+            # have no ayah sitemap, so derive every possible ayah key from the
+            # saved surah list and let the QU payload decide what has text.
+            tafsir_meta = catalog_book_meta(slug, names, source, catalog_entry)
+            if slug in ULOOM_WORD_SLUGS:
+                target_surahs = list(range(1, 115)) if full_mode else surahs
+                urls = synthetic_uloom_data_urls(
+                    slug, target_surahs, surah_meta_by_number)
+                print(f"[data] {slug}: {len(urls)} ayah keys from surah metadata")
             else:
+                urls = {} if args.refresh else sitemap_from_cache(
+                    old_cache.get("sitemap"))
                 if urls:
-                    fetch_cache["sitemap"] = sitemap_to_cache(slug, source, urls)
+                    print(f"[cache] {slug}: sitemap from disk ({len(urls)} pages)")
+                else:
+                    try:
+                        urls = get_ayah_urls(slug)
+                    except Exception as exc:  # noqa: BLE001
+                        urls = sitemap_from_cache(old_cache.get("sitemap"))
+                        if not urls:
+                            raise
+                        print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
+                              f"using saved copy", file=sys.stderr)
+                    else:
+                        if urls:
+                            fetch_cache["sitemap"] = sitemap_to_cache(
+                                slug, source, urls)
+                            cache_dirty = True
+        else:
+            tafsir_meta = None if args.refresh else old_cache.get("tafsir_meta")
+            if tafsir_meta:
+                print(f"[cache] {slug}: book info from disk")
+            else:
+                report: dict = {}
+                tafsir_meta = get_book_meta(slug, names, source, catalog_entry,
+                                            report=report)
+                if report.get("ok"):
+                    fetch_cache["tafsir_meta"] = tafsir_meta
                     cache_dirty = True
+                elif old_cache.get("tafsir_meta"):
+                    print(f"[warn] {slug}: cannot refresh book info; using saved copy",
+                          file=sys.stderr)
+                    tafsir_meta = old_cache["tafsir_meta"]
+
+            urls = {} if args.refresh else sitemap_from_cache(
+                old_cache.get("sitemap"))
+            if urls:
+                print(f"[cache] {slug}: sitemap from disk ({len(urls)} pages)")
+            else:
+                try:
+                    urls = get_ayah_urls(slug)
+                except Exception as exc:  # noqa: BLE001
+                    urls = sitemap_from_cache(old_cache.get("sitemap"))
+                    if not urls:
+                        raise
+                    print(f"[warn] {slug}: cannot refresh sitemap ({exc}); "
+                          f"using saved copy", file=sys.stderr)
+                else:
+                    if urls:
+                        fetch_cache["sitemap"] = sitemap_to_cache(slug, source, urls)
+                        cache_dirty = True
         if cache_dirty:
             try:
                 json_book.mkdir(parents=True, exist_ok=True)
@@ -3217,7 +3459,8 @@ def main(argv: Optional[List[str]] = None) -> int:
             continue
 
         scrape_surahs(slug, surahs_for_slug, urls, tafsir_meta,
-                      surah_meta_by_number, json_book, args, source=source)
+                      surah_meta_by_number, json_book, args, source=source,
+                      data_mode=args.from_data)
         if full_mode and not args.no_full_json:
             try:
                 full_path = write_full_json(
