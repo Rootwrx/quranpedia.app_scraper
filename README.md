@@ -30,26 +30,24 @@ Use `--source uloom` (or the shorthand `--uloom`) to read the
 [`uloom` index](https://quranpedia.app/uloom/index.html) instead of the tafsir
 index. The 78 uloom books split into two groups:
 
-- **69 ayah-based books** (134,210 ayah pages) also have `sitemap-<slug>.xml`
-  and `suraN-ayaM.html` pages structurally identical to tafsirs. They can still
-  be scraped that way with `--from-html`, using the same parser and DOCX code
-  as tafsirs. The sitemap is the source of truth for that mode's coverage; card
-  counts can differ when one page covers multiple ayahs (e.g. `2>1`).
-- **9 word/root dictionaries** (`raghib`, `umdah`, `ishtiqaqi`, `maqayees`,
-  `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are not ayah-based. Their
-  sitemaps list `/w/<root>.html` entries with `.well` content. Their `sura*.html`
-  URLs are byte-identical Baghawy tafsir pages, so HTML mode skips them with a
-  warning for `--books all` and rejects them with `[error]` if named
-  explicitly.
-- **Structured QU data is the default for all 78 uloom books.** It fetches
-  `https://quranpedia.app/uloom/_d/<s>-<a>.js` instead of full HTML pages. It
-  produces the same plain-text/styled-segment JSON, adds `data_url`,
-  `source_page`, and `source_coverage`, and supports the 9 word dictionaries
-  because it does not depend on HTML sitemaps or book-info pages. The QU files
+- **69 ayah-based books** (134,210 ayah pages) use structured QU data by
+  default: `https://quranpedia.app/uloom/_d/<s>-<a>.js` instead of full
+  `suraN-ayaM.html` pages. This produces the same plain-text/styled-segment
+  JSON and adds `data_url`, `source_page`, and `source_coverage`. The QU files
   change when book text changes, so they are never cached; the static `۞`
   marker list is cached in `quran-text.json`. `--from-data` is an explicit
-  alias for the default, while `--from-html` opts back into full pages. Both
-  are rejected for tafsirs and for `--docx`.
+  alias, and `--from-html` opts back into the original full-page pipeline.
+- **9 word/root dictionaries** (`raghib`, `umdah`, `ishtiqaqi`, `maqayees`,
+  `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are headword books, not ayah
+  books. Their sitemaps list `/w/<key>.html` entries. The QU ayah payload only
+  says which roots occur in an ayah; the real entry body is loaded on demand
+  from `https://quranpedia.app/uloom/_r/<slug>/<key>.js` via
+  `QR("<slug>","<key>","<html>")`. These books are scraped in sitemap order into
+  one `headwords.json` per book and built into one DOCX volume. `--surahs` is
+  ignored for them; use `--max-entries` while testing. Their `sura*.html` URLs
+  are byte-identical Baghawy tafsir pages, so `--from-html` rejects them.
+
+`--from-data` and `--from-html` are rejected for tafsirs and for `--docx`.
 
 Uloom slugs do not collide with tafsir slugs. Uloom also uses Arabic category
 folders now:
@@ -402,10 +400,12 @@ python scrape_quranpedia.py --books tabary --full --workers 12 --use-local-catal
 python scrape_quranpedia.py --books all --full --workers 12
 python scrape_quranpedia.py --books all --full --docx
 
-# uloom al-Quran: structured QU data is the default (word dicts included)
+# uloom ayah books: structured QU data is the default
 python scrape_quranpedia.py --source uloom --books asbab,qutayba --surahs 1-2
-python scrape_quranpedia.py --uloom --books raghib --surahs 1-2
-# opt back into the original full-HTML uloom pipeline
+# word dictionaries: headword entries from sitemap + /_r/ QR data
+python scrape_quranpedia.py --uloom --books raghib --max-entries 20
+python scrape_quranpedia.py --uloom --books raghib --docx
+# opt back into the original full-HTML uloom pipeline for ayah books
 python scrape_quranpedia.py --uloom --from-html --books asbab --surahs 1-2
 python scrape_quranpedia.py --uloom --books nashr --full
 python scrape_quranpedia.py --source uloom --category asbab --coverage full
@@ -478,14 +478,15 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
   page color `#F3EEE2`; ayah verses `#0F6B9C`; `t1` spans `#B22222`;
   collapsible verse/tafsir headings (Word outline levels 1/2); per-surah DOCX
   named `NNN سورة <الاسم>.docx`. ✅
-- Uloom: all 78 books use structured QU data by default; `--from-html` keeps
-  the original full-page scraper for the 69 ayah-based books. The 9 word/root
-  dictionaries work only in the default data mode. ✅ Uloom category/Arabic
-  folders are the next step after tafsir layout review.
+- Uloom: the 69 ayah-based books use structured QU data by default, and
+  `--from-html` keeps the original full-page scraper. The 9 word/root books
+  are separate headword books with their own `headwords.json` and DOCX volume.
+  ✅ Uloom category/Arabic folders are the next step after tafsir layout review.
 
 ## Still open (optional)
 
 - Include source URLs under every ayah in DOCX? Currently opt-in via
   `--include-source` (in combine mode, the source is repeated per tafsir).
-- A dedicated word/root-entry DOCX layout for the 9 uloom dictionaries; for now
-  the default QU mode renders their word lists with the normal ayah DOCX layout.
+- Optional ayah reference list per headword, built by reversing the QU `_d`
+  ayah payloads (the headword DOCX currently contains the dictionary entries
+  only).

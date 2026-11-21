@@ -27,11 +27,14 @@ Usage examples
   python scrape_quranpedia.py --combine katheer,saadi --surahs 2
   python scrape_quranpedia.py --combine katheer,saadi --full
 
-  # uloom books use structured QU data by default (also supports word dictionaries)
+  # ayah-based uloom books use structured QU data by default
   python scrape_quranpedia.py --uloom --books asbab,qutayba --surahs 1-2
   # opt back into the original full-HTML uloom pipeline
   python scrape_quranpedia.py --uloom --from-html --books asbab --surahs 1-2
-  python scrape_quranpedia.py --uloom --books raghib --surahs 1-2
+
+  # the 9 word dictionaries are headword books, scraped from /w/ + /_r/ data
+  python scrape_quranpedia.py --uloom --books raghib --max-entries 20
+  python scrape_quranpedia.py --uloom --books raghib --docx
   python scrape_quranpedia.py --uloom --books all --full --docx
 
   # everything, 12 workers (reuse the saved catalog on repeat runs)
@@ -108,6 +111,11 @@ ULOOM_WORD_SLUGS = frozenset({
 # Optional structured uloom source: one QU(...) payload per ayah. These files
 # change when book text changes, so they are fetched fresh and never cached.
 ULOOM_DATA_URL = BASE + "/uloom/_d/{surah}-{ayah}.js"
+
+# Word dictionaries are headword books. Their QU ayah payload only lists which
+# roots occur in an ayah; the entry body itself lives in static QR(...) files.
+ULOOM_WORD_R_URL = BASE + "/uloom/_r/{slug}/{key}.js"
+WORD_HEADWORDS_FILE = "headwords.json"
 
 # The QU word list uses different combining marks for tanween than the HTML
 # ayah element. Translate them so --from-data ayah_text matches HTML mode.
@@ -1345,7 +1353,7 @@ def catalog_book_meta(slug: str, names: Dict[str, str], source: str,
     """
     catalog_entry = catalog_entry or {}
     path = SOURCE_PATHS[source]
-    return {
+    meta = {
         "slug": slug,
         "name": catalog_entry.get("display_name") or names.get(slug, slug),
         "display_name": catalog_entry.get("display_name") or names.get(slug, slug),
@@ -1360,6 +1368,9 @@ def catalog_book_meta(slug: str, names: Dict[str, str], source: str,
         "coverages": catalog_entry.get("coverages", []),
         "source": f"{BASE}/{path}/{slug}/index.html",
     }
+    if source == "uloom" and slug in ULOOM_WORD_SLUGS:
+        meta["kind"] = "word"
+    return meta
 
 
 def get_tafsir_meta(slug: str, names: Dict[str, str]) -> dict:
@@ -1621,6 +1632,173 @@ def parse_uloom_data_ayah(raw, slug: str, surah: int, ayah: int, url: str,
     if include_html:
         item["tafsir_html"] = html
     return item
+
+
+def parse_word_data(raw, slug: str, key: str, page_url: str, data_url: str,
+                    include_html: bool, styled: bool) -> dict:
+    """Decode one `QR("book","key","<html>")` word-entry payload.
+
+    The entry body is the same inline HTML used by /w/<key>.html, so it reuses
+    the tafsir segment parser and stays plain text plus styled segments.
+    """
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", "ignore")
+    text = str(raw).strip()
+    match = re.match(r"^QR\s*\(", text)
+    if not match:
+        raise ValueError("not a uloom word data file")
+    end = text.rfind(")")
+    if end <= match.end():
+        raise ValueError("truncated uloom word data file")
+    args = json.loads("[" + text[match.end():end] + "]")
+    if len(args) < 3:
+        raise ValueError("uloom word data file has too few arguments")
+    if str(args[0]) != slug or str(args[1]) != key:
+        raise ValueError(f"word data mismatch: {args[0]}/{args[1]} != {slug}/{key}")
+    html = str(args[2])
+
+    if _lxml_html is None or include_html:
+        doc = BeautifulSoup(html, "lxml")
+        segments = tafsir_html_to_segments(doc)
+    else:
+        doc = _lxml_html.document_fromstring(
+            f"<div>{html}</div>", parser=_lxml_parser())
+        segments = tafsir_html_to_segments_lxml(doc)
+
+    entry = {
+        "key": key,
+        "entry_text": segments_to_text(segments),
+        "source_url": page_url,
+        "data_url": data_url,
+    }
+    if styled:
+        entry["entry_segments"] = segments
+    if include_html:
+        entry["entry_html"] = html
+    return entry
+
+
+def get_word_entry_list(slug: str, book_dir: Path, *, refresh: bool,
+                        retries: int, timeout: int, delay: float
+                        ) -> List[Tuple[str, str, str]]:
+    """Return [(key, headword, page_url)] in sitemap order for a word book."""
+    cache = {} if refresh else load_fetch_cache(book_dir)
+    saved = cache.get("word_entries")
+    if saved:
+        return [(str(item[0]), str(item[1]) if len(item) > 1 else str(item[0]),
+                 str(item[2]) if len(item) > 2 else "")
+                for item in saved]
+
+    xml = fetch_text(f"{BASE}/sitemap-{slug}.xml", retries=retries,
+                     timeout=timeout, delay=delay)
+    page_urls = [loc for loc in re.findall(r"<loc>(.*?)</loc>", xml)
+                 if "/w/" in loc]
+    if not page_urls:
+        raise ValueError(f"no /w/ entries in sitemap-{slug}.xml")
+
+    index_html = fetch_text(f"{BASE}/uloom/{slug}/index.html",
+                            retries=retries, timeout=timeout, delay=delay)
+    index_soup = BeautifulSoup(index_html, "lxml")
+    labels: Dict[str, str] = {}
+    for link in index_soup.select('a[href^="w/"]'):
+        match = re.search(r"w/([^/?#]+)\.html", link.get("href", ""))
+        if match:
+            labels.setdefault(match.group(1), link.get_text(" ", strip=True))
+
+    entries: List[Tuple[str, str, str]] = []
+    seen = set()
+    for url in page_urls:
+        match = re.search(r"/w/([^/?#]+)\.html", url)
+        if not match:
+            continue
+        key = match.group(1)
+        if key in seen:
+            continue
+        seen.add(key)
+        entries.append((key, labels.get(key) or key, url))
+    if not entries:
+        raise ValueError(f"could not parse /w/ entries for {slug}")
+
+    cache["word_entries"] = [list(entry) for entry in entries]
+    save_fetch_cache(book_dir, cache)
+    return entries
+
+
+def scrape_word_entries(slug: str, entries: List[Tuple[str, str, str]],
+                        tafsir_meta: dict, catalog_entry: dict,
+                        json_book: Path, args, source: str
+                        ) -> Tuple[Optional[Path], int]:
+    """Fetch all /_r/<slug>/<key>.js bodies and write one headword JSON file."""
+    path = json_book / WORD_HEADWORDS_FILE
+    limit = max(0, args.max_entries)
+    selected = entries[:limit] if limit else entries
+    expected = len(selected)
+
+    if path.exists() and not args.force:
+        saved = json_read(path)
+        if saved and int(saved.get("entry_count") or 0) >= expected:
+            print(f"[skip] {slug}: {saved['entry_count']} headwords saved {path}")
+            return path, 0
+
+    def fetch_entry(item: Tuple[str, str, str]) -> dict:
+        key, headword, page_url = item
+        data_url = ULOOM_WORD_R_URL.format(slug=slug, key=key)
+        raw = fetch_text(data_url, retries=args.retries, timeout=args.timeout,
+                         delay=args.delay)
+        entry = parse_word_data(raw, slug, key, page_url, data_url,
+                                args.include_html, args.styled)
+        entry["headword"] = headword
+        return entry
+
+    fetched: Dict[str, dict] = {}
+    failed = 0
+    started = time.monotonic()
+    with ThreadPoolExecutor(max_workers=args.workers) as pool:
+        futures = {pool.submit(fetch_entry, item): item for item in selected}
+        for done, future in enumerate(as_completed(futures), 1):
+            key = futures[future][0]
+            try:
+                fetched[key] = future.result()
+            except Exception as exc:  # noqa: BLE001
+                failed += 1
+                print(f"[error] {slug} {key}: {exc}", file=sys.stderr)
+            if args.stats and (done % 100 == 0 or done == expected):
+                elapsed = max(time.monotonic() - started, 0.001)
+                print(f"[progress] {slug}: {done}/{expected} headwords "
+                      f"({done * 100 // expected}%) elapsed {elapsed:.0f}s")
+
+    ordered = [fetched[key] for key, _headword, _url in selected if key in fetched]
+    payload = {
+        "kind": "word",
+        "slug": slug,
+        "book": tafsir_meta,
+        "source_index": f"{BASE}/uloom/{slug}/index.html",
+        "entry_count": len(ordered),
+        "total_entries": len(entries),
+        "scraped_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "entries": ordered,
+    }
+    try:
+        json_write(path, payload)
+    except OSError as exc:
+        print(f"[error] {slug}: cannot write headword JSON {path}: {exc}",
+              file=sys.stderr)
+        return None, failed + 1
+    print(f"[ok]   {slug}: {len(ordered)}/{expected} headwords -> {path}")
+    return path, failed
+
+
+def load_word_json(json_book: Path) -> Optional[dict]:
+    """Load a word dictionary's headword JSON without touching the network."""
+    path = json_book / WORD_HEADWORDS_FILE
+    if not path.exists():
+        print(f"[error] missing JSON {path}", file=sys.stderr)
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        print(f"[error] cannot read JSON {path}: {exc}", file=sys.stderr)
+        return None
 
 
 def parse_ayah_page(html, slug: str, surah: int, ayah: int, url: str,
@@ -2832,6 +3010,111 @@ def build_docx_for_surahs(slug: str, surahs: List[int], json_dir: Path,
     return files
 
 
+def add_word_cover_page(doc, data: dict, *, font_name: str, font_size: float,
+                        line_spacing: float) -> None:
+    """Cover page for a headword dictionary (same styling as ayah books)."""
+    meta = data.get("book") or {}
+    table = doc.add_table(rows=1, cols=1)
+    table.autofit = False
+    center_cover_table(table)
+    cell = table.cell(0, 0)
+    for p in list(cell.paragraphs):
+        p._element.getparent().remove(p._element)
+
+    add_paragraph(
+        cell, "بسم الله الرحمن الرحيم", size=font_size, bold=True,
+        color=(11, 74, 49), font_name=font_name,
+        line_spacing=line_spacing, space_after=font_size * 2, jc="center",
+    )
+    title = (meta.get("display_name") or meta.get("name")
+             or data.get("slug", ""))
+    subtitle = meta.get("book") or meta.get("title") or ""
+    add_paragraph(
+        cell, title, size=font_size + 10, bold=True, color=(11, 74, 49),
+        font_name=font_name, line_spacing=line_spacing,
+        space_after=font_size / 2, jc="center",
+    )
+    if subtitle and subtitle != title:
+        add_paragraph(
+            cell, subtitle, size=font_size + 4, bold=True, color=(11, 74, 49),
+            font_name=font_name, line_spacing=line_spacing,
+            space_after=font_size, jc="center",
+        )
+
+    details: List[Tuple[str, str]] = []
+    author = clean_label(meta.get("author") or "")
+    if author:
+        details.append(("المؤلف", author))
+    count = int(data.get("entry_count") or 0)
+    if count:
+        details.append(("عدد المواد", str(count)))
+    if data.get("scraped_at"):
+        details.append(("تاريخ الجمع", str(data["scraped_at"])))
+    source = data.get("source_index") or meta.get("source", "")
+    if source:
+        details.append(("المصدر", str(source)))
+    for label, value in details:
+        add_paragraph(
+            cell, f"{label}: {value}", size=font_size, bold=True,
+            font_name=font_name, line_spacing=line_spacing,
+            space_after=font_size / 4, jc="center",
+        )
+    doc.add_page_break()
+
+
+def build_word_docx(slug: str, json_book: Path, docx_book: Path, *,
+                    output_name: str, font_name: str, font_size: float,
+                    include_source: bool, quran_font: str,
+                    quran_classes: set, bold: bool, line_spacing: float,
+                    page_color: str, t1_color: Tuple[int, int, int]
+                    ) -> List[Path]:
+    """Build one DOCX volume from a word dictionary's headword JSON."""
+    if Document is None:
+        raise RuntimeError("python-docx is not installed; install with: pip install python-docx")
+    data = load_word_json(json_book)
+    if data is None:
+        return []
+
+    doc = Document()
+    style_document(doc, font_name, font_size, page_color)
+    add_word_cover_page(doc, data, font_name=font_name, font_size=font_size,
+                        line_spacing=line_spacing)
+
+    for entry in data.get("entries", []):
+        headword = entry.get("headword") or entry.get("key", "")
+        add_paragraph(
+            doc, headword, size=font_size + 4, bold=True,
+            color=(11, 74, 49), font_name=font_name,
+            line_spacing=line_spacing, space_after=4,
+            style=doc.styles[SURAH_HEADING_STYLE], outline_level=0,
+        )
+        segments = entry.get("entry_segments")
+        if segments:
+            for line in segments:
+                add_styled_line(doc, line, font_size, font_name, quran_font,
+                                quran_classes, bold=bold,
+                                line_spacing=line_spacing, t1_color=t1_color)
+        else:
+            for line in str(entry.get("entry_text", "")).split("\n"):
+                add_paragraph(doc, line, size=font_size, font_name=font_name,
+                              bold=bold, line_spacing=line_spacing)
+        if include_source:
+            add_paragraph(doc, entry.get("source_url", ""), size=font_size - 2,
+                          color=(110, 110, 110), font_name=font_name,
+                          line_spacing=line_spacing)
+
+    path = docx_book / output_name
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        doc.save(path)
+    except OSError as exc:
+        print(f"[error] cannot write {path}: {exc} — close it in Microsoft Word and retry",
+              file=sys.stderr)
+        return []
+    print(f"[docx] {path}")
+    return [path]
+
+
 def build_combined_docx_for_surahs(
     slugs: List[str], surahs: List[int], json_dir: Path, docx_dir: Path,
     label: str, font_name: str, font_size: float, include_source: bool,
@@ -3072,6 +3355,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help=argparse.SUPPRESS)  # backwards-compatible alias
     p.add_argument("--max-ayahs", type=int, default=0,
                    help="limit ayahs per surah while scraping (0 = no limit)")
+    p.add_argument("--max-entries", type=int, default=0,
+                   help="limit headwords for word dictionaries (0 = no limit)")
     p.add_argument("--workers", type=int, default=12, help="concurrent requests (default: 12)")
     p.add_argument("--retries", type=int, default=3)
     p.add_argument("--timeout", type=int, default=30)
@@ -3133,6 +3418,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     books_arg = args.books or args.legacy_tafsirs
     if args.workers < 1:
         print("[error] --workers must be at least 1", file=sys.stderr)
+        return 2
+    if args.max_entries < 0:
+        print("[error] --max-entries cannot be negative", file=sys.stderr)
         return 2
     configure_http_pool(args.workers)
 
@@ -3274,21 +3562,21 @@ def main(argv: Optional[List[str]] = None) -> int:
             if build_only:
                 slugs = discover_local_slugs(args.json_dir, source)
                 if catalog:
-                    slugs = [s for s in slugs
-                             if local_surah_numbers(
-                                 s, args.json_dir,
-                                 book_dir=find_local_book_dir(
-                                     args.json_dir, source, s, catalog))]
+                    kept = []
+                    for s in slugs:
+                        book_dir = find_local_book_dir(
+                            args.json_dir, source, s, catalog)
+                        if local_surah_numbers(s, args.json_dir, book_dir=book_dir):
+                            kept.append(s)
+                        elif (source == "uloom" and s in ULOOM_WORD_SLUGS
+                              and (book_dir / WORD_HEADWORDS_FILE).exists()):
+                            kept.append(s)
+                    slugs = kept
             else:
                 saved_slugs = [] if args.refresh else sorted(catalog.get("books", {}))
                 all_slugs = saved_slugs or get_all_slugs(source)
                 slugs = [s for s in all_slugs if s not in ULOOM_WORD_SLUGS] \
                     if source == "uloom" and not args.from_data else all_slugs
-            if source == "uloom" and slugs:
-                skipped = [s for s in slugs if s in ULOOM_WORD_SLUGS]
-                if skipped:
-                    print(f"[warn] skipping {len(skipped)} unsupported word-based "
-                          f"uloom book(s): {', '.join(skipped)}", file=sys.stderr)
         else:
             slugs = explicit
 
@@ -3358,6 +3646,50 @@ def main(argv: Optional[List[str]] = None) -> int:
             args.json_dir, args.docx_dir, source, slug, catalog,
             migrate=not build_only)
         catalog_entry = catalog.get("books", {}).get(slug, {})
+
+        if source == "uloom" and slug in ULOOM_WORD_SLUGS:
+            output_name = full_docx_name(slug, catalog, source)
+            if build_only:
+                built = build_word_docx(
+                    slug, json_book, docx_book, output_name=output_name,
+                    font_name=args.tafsir_font, font_size=args.font_size,
+                    include_source=args.include_source, quran_font=args.quran_font,
+                    quran_classes=quran_classes, bold=args.bold_tafsir,
+                    line_spacing=args.line_spacing, page_color=args.page_color,
+                    t1_color=t1_color,
+                )
+                if not built:
+                    print(f"[error] {slug}: could not build {output_name}",
+                          file=sys.stderr)
+                    any_error = True
+            else:
+                tafsir_meta = catalog_book_meta(slug, names, source, catalog_entry)
+                print(f"[word] {slug}: headword mode (--surahs ignored)")
+                try:
+                    entries = get_word_entry_list(
+                        slug, json_book, refresh=args.refresh,
+                        retries=args.retries, timeout=args.timeout,
+                        delay=args.delay)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[error] {slug}: cannot read word sitemap: {exc}",
+                          file=sys.stderr)
+                    any_error = True
+                    continue
+                print(f"[word] {slug}: {len(entries)} headwords from sitemap")
+                try:
+                    write_book_meta(json_book / "meta.json", tafsir_meta,
+                                    catalog_entry, {}, source, slug)
+                except OSError as exc:
+                    print(f"[error] {slug}: cannot write metadata: {exc}",
+                          file=sys.stderr)
+                    any_error = True
+                    continue
+                _path, failed = scrape_word_entries(
+                    slug, entries, tafsir_meta, catalog_entry, json_book,
+                    args, source)
+                if failed:
+                    any_error = True
+            continue
 
         if build_only:
             available = local_surah_numbers(slug, json_root, book_dir=json_book)
