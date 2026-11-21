@@ -17,9 +17,10 @@ Usage examples
   python scrape_quranpedia.py --tafsirs tabary --full
   python scrape_quranpedia.py --tafsirs tabary --full --docx
 
-  # select every tafsir in a site category (Arabic name or era slug)
-  python scrape_quranpedia.py --category المتقدمون --full
-  python scrape_quranpedia.py --category era-2 --full --docx
+  # select tafsirs by nested category: era / method / coverage
+  python scrape_quranpedia.py --category المتقدمون --surahs 1
+  python scrape_quranpedia.py --category era-2 --method athar --coverage full --full
+  python scrape_quranpedia.py --method lugha --coverage partial --docx
 
   # combine tafsirs from local JSON: each verse, then its tafsir from each book
   python scrape_quranpedia.py --combine katheer,saadi --surahs 2
@@ -68,6 +69,10 @@ TAFSEER_INDEX = f"{BASE}/tafseer/index.html"
 ULOOM_INDEX = f"{BASE}/uloom/index.html"
 SOURCE_PATHS = {"tafseer": "tafseer", "uloom": "uloom"}
 DEFAULT_CATEGORY_NAME = "غير مصنف"
+METHOD_OTHER_SLUG = "method-other"
+METHOD_OTHER_NAME = "غير محدد المنهج"
+COVERAGE_OTHER_SLUG = "coverage-unspecified"
+COVERAGE_OTHER_NAME = "غير محدد التغطية"
 
 # These uloom books are word/root dictionaries: their sitemaps list /w/*.html
 # entries, not suraN-ayaM.html pages. Their sura*.html URLs exist but are just
@@ -154,6 +159,12 @@ def tag_slug(label: str) -> str:
     return "tag-" + (suffix or "misc")
 
 
+def option_count(label: str) -> Optional[int]:
+    """Read the declared count from an option label like 'بالمأثور (12)'."""
+    match = re.search(r"\((\d+)\)\s*$", clean_label(label))
+    return int(match.group(1)) if match else None
+
+
 def json_read(path: Path) -> Optional[dict]:
     """Read a JSON object without raising on missing/corrupt files."""
     try:
@@ -205,9 +216,14 @@ def build_catalog(source: str, names: Dict[str, str], *,
                   delay: float = 0.0) -> dict:
     """Build a local category catalog for the requested source.
 
-    Tafsir categories come from the five era sections on /tafseer/index.html.
-    The overlapping "الأكثر قراءة" shelf and card marks are kept as extra
-    selectable categories, but the era section is the primary folder.
+    Tafsir folders are nested:
+
+        era / method / coverage / book
+
+    The era comes from the five h2.era-h sections on /tafseer/index.html.
+    Method (المنهج) and coverage (التغطية) come from the filter selects and the
+    stable data-k / data-f attributes on each card's <li>. The overlapping
+    "الأكثر قراءة" shelf and card marks remain extra selectable categories.
     """
     if source != "tafseer":
         return {"source": source, "source_index": ULOOM_INDEX,
@@ -219,19 +235,42 @@ def build_catalog(source: str, names: Dict[str, str], *,
     soup = BeautifulSoup(html, "lxml")
     categories: List[dict] = []
     books: Dict[str, dict] = {}
-    category_by_slug: Dict[str, dict] = {}
+    category_by_key: Dict[Tuple[str, str], dict] = {}
 
     def add_category(slug: str, name: str, kind: str,
-                     declared: Optional[int] = None) -> dict:
-        cat = category_by_slug.get(slug)
+                     declared: Optional[int] = None,
+                     aliases: Iterable[str] = ()) -> dict:
+        key = (kind, slug)
+        clean_name = re.sub(r"\s*\(\d+\)\s*$", "", clean_label(name))
+        cat = category_by_key.get(key)
         if cat is None:
-            cat = {"slug": slug, "name": name, "kind": kind,
-                   "declared_count": declared, "observed_book_count": 0}
-            category_by_slug[slug] = cat
+            cat = {
+                "slug": slug,
+                "name": clean_name,
+                "kind": kind,
+                "declared_count": declared,
+                "observed_book_count": 0,
+                "aliases": [clean_label(a) for a in aliases if clean_label(a)],
+            }
+            category_by_key[key] = cat
             categories.append(cat)
-        elif declared is not None and cat.get("declared_count") is None:
-            cat["declared_count"] = declared
+        else:
+            if declared is not None and cat.get("declared_count") is None:
+                cat["declared_count"] = declared
+            for alias in aliases:
+                value = clean_label(alias)
+                if value and value not in cat.get("aliases", []):
+                    cat.setdefault("aliases", []).append(value)
         return cat
+
+    def cat_ref(cat: dict) -> dict:
+        return {"slug": cat["slug"], "name": cat["name"], "kind": cat["kind"]}
+
+    def add_to_entry(entry: dict, cat: dict) -> None:
+        existing = entry.setdefault("categories", [])
+        if not any(c.get("slug") == cat["slug"] and c.get("kind") == cat["kind"]
+                   for c in existing):
+            existing.append(cat_ref(cat))
 
     def ensure_book(slug: str) -> dict:
         entry = books.get(slug)
@@ -245,48 +284,79 @@ def build_catalog(source: str, names: Dict[str, str], *,
                 "author": "",
                 "death_hijri": "",
                 "category": {"slug": "", "name": DEFAULT_CATEGORY_NAME, "kind": "era"},
+                "facets": {},
                 "categories": [],
+                "path_categories": [],
                 "cards": [],
                 "source": f"{BASE}/tafseer/{slug}/index.html",
             }
             books[slug] = entry
         return entry
 
+    # Parse the two filter selects before processing cards so the stable
+    # data-k / data-f values can be mapped to Arabic labels and slugs.
+    method_cats: Dict[str, dict] = {}
+    for option in soup.select("select[data-tf-k] option[value]"):
+        value = clean_label(option.get("value") or "")
+        label = clean_label(option.get_text(" ", strip=True))
+        if not value or not label or label == "الكل":
+            continue
+        method_cats[value] = add_category(
+            f"method-{value}", label, "method", option_count(label), [value])
+    method_other = add_category(
+        METHOD_OTHER_SLUG, METHOD_OTHER_NAME, "method", aliases=["other"])
+
+    coverage_cats: Dict[str, dict] = {}
+    for option in soup.select("select[data-tf-f] option[value]"):
+        value = clean_label(option.get("value") or "")
+        label = clean_label(option.get_text(" ", strip=True))
+        if not value or not label or label == "الكل":
+            continue
+        suffix = {"1": "full", "0": "partial"}.get(value, value)
+        coverage_cats[value] = add_category(
+            f"coverage-{suffix}", label, "coverage",
+            option_count(label), [value, suffix])
+    coverage_other = add_category(
+        COVERAGE_OTHER_SLUG, COVERAGE_OTHER_NAME, "coverage", aliases=["unknown"])
+
     container = soup.select_one("section.well") or soup
     headings = container.select("h2.era-h")
-    for index, heading in enumerate(headings):
-        slug = clean_label(heading.get("id") or "")
+    for heading in headings:
+        era_slug = clean_label(heading.get("id") or "")
         small = heading.find("small")
-        name = clean_label(heading.get_text(" ", strip=True))
+        era_name = clean_label(heading.get_text(" ", strip=True))
         if small:
             small_text = clean_label(small.get_text(" ", strip=True))
             if small_text:
-                name = clean_label(name.replace(small_text, "", 1))
+                era_name = clean_label(era_name.replace(small_text, "", 1))
         declared = None
         if small:
             nums = re.findall(r"\d+", small.get_text(" ", strip=True))
             if nums:
                 declared = int(nums[-1])  # the final number is the book count
-        if not slug or not name:
+        if not era_slug or not era_name:
             continue
-        cat = add_category(slug, name, "era", declared)
+        era_cat = add_category(era_slug, era_name, "era", declared)
 
-        cards = []
+        cards: List[Tuple[Optional[object], object]] = []
         node = heading.find_next_sibling()
         while node is not None and not (
             getattr(node, "name", None) == "h2"
             and "era-h" in (node.get("class") or [])
         ):
             if getattr(node, "name", None) == "ul":
-                cards.extend(node.select("a.tcard[href]"))
+                for li in node.select("li"):
+                    link = li.select_one("a.tcard[href]")
+                    if link is not None:
+                        cards.append((li, link))
             elif getattr(node, "name", None) == "a" and "tcard" in (node.get("class") or []):
-                cards.append(node)
+                cards.append((None, node))
             node = node.find_next_sibling()
 
-        cat["observed_book_count"] = len(cards)
-        cat_entry = {"slug": cat["slug"], "name": cat["name"], "kind": cat["kind"]}
+        era_cat["observed_book_count"] = len(cards)
+        primary_era = era_slug != "era-top"
 
-        for card in cards:
+        for li, card in cards:
             href = str(card.get("href") or "")
             match = re.search(r"\./([a-z0-9-]+)/index\.html", href)
             if not match:
@@ -316,25 +386,39 @@ def build_catalog(source: str, names: Dict[str, str], *,
                 if nums:
                     entry["death_hijri"] = nums.group(0)
 
-            if slug != "era-top" and not entry["category"].get("slug"):
-                entry["category"] = dict(cat_entry)
-            if not any(c["slug"] == cat["slug"] for c in entry["categories"]):
-                entry["categories"].append(dict(cat_entry))
+            raw_method = clean_label(li.get("data-k") or "") if li is not None else ""
+            raw_coverage = clean_label(li.get("data-f") or "") if li is not None else ""
+            method_cat = method_cats.get(raw_method, method_other)
+            coverage_cat = coverage_cats.get(raw_coverage, coverage_other)
+
+            add_to_entry(entry, era_cat)
+            add_to_entry(entry, method_cat)
+            add_to_entry(entry, coverage_cat)
+
+            if primary_era and not entry["category"].get("slug"):
+                entry["category"] = cat_ref(era_cat)
+                entry["facets"] = {
+                    "era": cat_ref(era_cat),
+                    "method": cat_ref(method_cat),
+                    "coverage": cat_ref(coverage_cat),
+                }
+
             entry["cards"].append({
-                "category_slug": cat["slug"],
+                "category_slug": era_cat["slug"],
+                "method": raw_method,
+                "coverage": raw_coverage,
+                "method_category": method_cat["slug"],
+                "coverage_category": coverage_cat["slug"],
                 "url": f"{BASE}/tafseer/{book_slug}/index.html",
                 "label": clean_label(title_el.get_text(" ", strip=True)) if title_el else "",
-                "shelf": "popular" if slug == "era-top" else "era",
+                "shelf": "popular" if not primary_era else "era",
             })
 
             for mark in card.select(".tc-tg .mark"):
                 label = clean_label(mark.get_text(" ", strip=True))
                 if not label:
                     continue
-                tcat = add_category(tag_slug(label), label, "tag")
-                tentry = {"slug": tcat["slug"], "name": tcat["name"], "kind": tcat["kind"]}
-                if not any(c["slug"] == tentry["slug"] for c in entry["categories"]):
-                    entry["categories"].append(tentry)
+                add_to_entry(entry, add_category(tag_slug(label), label, "tag"))
 
     for slug, label in sorted(names.items()):
         ensure_book(slug)
@@ -342,20 +426,42 @@ def build_catalog(source: str, names: Dict[str, str], *,
     for entry in books.values():
         if not entry["category"].get("slug"):
             fallback = add_category("uncategorized", DEFAULT_CATEGORY_NAME, "era")
-            entry["category"] = {"slug": fallback["slug"], "name": fallback["name"],
-                                 "kind": fallback["kind"]}
-            if not any(c["slug"] == fallback["slug"] for c in entry["categories"]):
-                entry["categories"].append(dict(entry["category"]))
-
-    display_names = build_display_names(books)
-    for slug, display in display_names.items():
-        books[slug]["display_name"] = display
+            entry["category"] = cat_ref(fallback)
+            add_to_entry(entry, fallback)
+        if not entry.get("facets"):
+            entry["facets"] = {
+                "era": dict(entry["category"]),
+                "method": cat_ref(method_other),
+                "coverage": cat_ref(coverage_other),
+            }
+        facets = entry["facets"]
+        for kind in ("method", "coverage"):
+            ref = facets.get(kind) or cat_ref(
+                method_other if kind == "method" else coverage_other)
+            facets[kind] = ref
+            add_to_entry(entry, add_category(
+                ref["slug"], ref["name"], kind))
+        entry["path_categories"] = [
+            dict(entry["category"]), dict(facets["method"]), dict(facets["coverage"])]
 
     for cat in categories:
         cat["observed_book_count"] = sum(
             1 for entry in books.values()
-            if any(c.get("slug") == cat["slug"] for c in entry.get("categories", []))
+            if any(c.get("slug") == cat["slug"] and c.get("kind") == cat["kind"]
+                   for c in entry.get("categories", []))
         )
+        if cat["kind"] in ("method", "coverage") and cat["declared_count"] is None:
+            cat["declared_count"] = cat["observed_book_count"]
+
+    # Drop unused fallback buckets so the catalog only lists real site facets.
+    categories[:] = [
+        cat for cat in categories
+        if cat["observed_book_count"] or cat["slug"] == METHOD_OTHER_SLUG
+    ]
+
+    display_names = build_display_names(books)
+    for slug, display in display_names.items():
+        books[slug]["display_name"] = display
 
     return {
         "source": source,
@@ -390,9 +496,10 @@ def catalog_slugs(catalog: dict, values: Iterable[str]) -> set:
     wanted = {clean_label(value).lower() for value in values if clean_label(value)}
     result = set()
     for cat in catalog.get("categories", []):
-        if (clean_label(cat.get("slug", "")).lower() in wanted
-                or clean_label(cat.get("name", "")).lower() in wanted):
-            result.add(cat["slug"])
+        candidates = [cat.get("slug", ""), cat.get("name", "")]
+        candidates.extend(cat.get("aliases", []))
+        if any(clean_label(value).lower() in wanted for value in candidates):
+            result.add((cat.get("kind", ""), cat["slug"]))
     return result
 
 
@@ -400,12 +507,47 @@ def slugs_from_categories(catalog: dict, values: Iterable[str]) -> List[str]:
     wanted = catalog_slugs(catalog, values)
     return sorted(
         slug for slug, entry in catalog.get("books", {}).items()
-        if any(cat.get("slug") in wanted for cat in entry.get("categories", []))
+        if any((cat.get("kind", ""), cat.get("slug")) in wanted
+               for cat in entry.get("categories", []))
     )
+
+
+def slugs_from_facets(catalog: dict, *, methods: Iterable[str] = (),
+                      coverages: Iterable[str] = ()) -> List[str]:
+    """Intersect selected method and coverage facets."""
+    result: Optional[List[str]] = None
+    for values in (methods, coverages):
+        values = list(values)
+        if not values:
+            continue
+        matching = set(slugs_from_categories(catalog, values))
+        result = matching if result is None else (result & matching)
+    return sorted(result) if result is not None else sorted(catalog.get("books", {}))
 
 
 def uses_arabic_layout(catalog: dict, source: str) -> bool:
     return source == "tafseer" and bool(catalog.get("books"))
+
+
+def path_categories(entry: dict) -> List[str]:
+    """Arabic folder components for a book: era, method, coverage."""
+    components: List[str] = []
+    for ref in entry.get("path_categories", []):
+        name = clean_label(ref.get("name") or "")
+        if name:
+            components.append(safe_component(name))
+    if components:
+        return components
+    # Older catalogs only know the era; keep them readable.
+    era = clean_label((entry.get("category") or {}).get("name"))
+    return [safe_component(era or DEFAULT_CATEGORY_NAME)]
+
+
+def old_arabic_relative(source: str, entry: dict) -> Path:
+    """Layout used before method/coverage folders were added."""
+    display = clean_label(entry.get("display_name") or entry.get("slug", "")) or entry.get("slug", "")
+    era = clean_label((entry.get("category") or {}).get("name")) or DEFAULT_CATEGORY_NAME
+    return Path(SOURCE_PATHS[source]) / safe_component(era) / safe_component(display or "")
 
 
 def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
@@ -413,10 +555,11 @@ def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
     """Return (json book dir, docx book dir) for a slug.
 
     New tafsir layout:
-        <json_root>/tafseer/<Arabic era category>/<Arabic tafsir name>/
-        <docx_root>/tafseer/<Arabic era category>/<Arabic tafsir name>/
+        <root>/tafseer/<era>/<method>/<coverage>/<Arabic tafsir name>/
+    Older layout:
+        <root>/tafseer/<era>/<Arabic tafsir name>/
     Legacy layout:
-        <json_root>/<slug>/ and <docx_root>/<slug>/
+        <root>/<slug>/
     """
     legacy_json = json_root / slug
     legacy_docx = docx_root / slug
@@ -424,9 +567,11 @@ def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
         return legacy_json, legacy_docx
 
     entry = catalog.get("books", {}).get(slug, {})
-    category = clean_label((entry.get("category") or {}).get("name")) or DEFAULT_CATEGORY_NAME
     display = clean_label(entry.get("display_name") or slug) or slug
-    relative = Path(SOURCE_PATHS[source]) / safe_component(category) / safe_component(display)
+    relative = Path(SOURCE_PATHS[source])
+    for component in path_categories(entry):
+        relative /= component
+    relative /= safe_component(display)
     new_json = json_root / relative
     new_docx = docx_root / relative
     if prefer_legacy:
@@ -438,73 +583,96 @@ def book_paths(json_root: Path, docx_root: Path, source: str, slug: str,
 
 
 def find_local_book_dir(json_dir: Path, source: str, slug: str, catalog: dict) -> Path:
-    """Locate a book's JSON dir in new or legacy layout, without network."""
+    """Locate a book's JSON dir in new, older, or legacy layout, without network."""
     preferred, _ = book_paths(json_dir, json_dir, source, slug, catalog)
     legacy = json_dir / slug
+    if not uses_arabic_layout(catalog, source):
+        return legacy
+
+    entry = catalog.get("books", {}).get(slug, {})
+    old_arabic = json_dir / old_arabic_relative(source, entry)
 
     def has_data(path: Path) -> bool:
         return (path / "meta.json").exists() or any(path.glob("sura*.json"))
 
-    if uses_arabic_layout(catalog, source):
-        if has_data(preferred):
-            return preferred
-        if has_data(legacy):
-            return legacy
-        source_root = json_dir / SOURCE_PATHS[source]
-        if source_root.exists():
-            for meta_path in sorted(source_root.glob("*/*/meta.json")):
-                data = json_read(meta_path)
-                if data and str(data.get("slug", "")) == slug:
-                    return meta_path.parent
-        return preferred
-    return legacy
+    for candidate in (preferred, old_arabic, legacy):
+        if has_data(candidate):
+            return candidate
+    source_root = json_dir / SOURCE_PATHS[source]
+    if source_root.exists():
+        for meta_path in sorted(source_root.rglob("meta.json")):
+            data = json_read(meta_path)
+            if data and str(data.get("slug", "")) == slug:
+                return meta_path.parent
+    return preferred
+
+
+def find_local_docx_dir(docx_dir: Path, source: str, slug: str, catalog: dict) -> Path:
+    """Locate a book's DOCX dir in new, older, or legacy layout."""
+    _, preferred = book_paths(docx_dir, docx_dir, source, slug, catalog)
+    legacy = docx_dir / slug
+    if not uses_arabic_layout(catalog, source):
+        return legacy
+
+    entry = catalog.get("books", {}).get(slug, {})
+    old_arabic = docx_dir / old_arabic_relative(source, entry)
+
+    def has_docx(path: Path) -> bool:
+        return path.is_dir() and any(path.glob("*.docx"))
+
+    for candidate in (preferred, old_arabic, legacy):
+        if has_docx(candidate):
+            return candidate
+    source_root = docx_dir / SOURCE_PATHS[source]
+    if source_root.exists():
+        display = safe_component(clean_label(entry.get("display_name") or slug) or slug)
+        for path in sorted(source_root.rglob(display)):
+            if has_docx(path):
+                return path
+    return preferred
 
 
 def resolve_book_paths(json_dir: Path, docx_dir: Path, source: str, slug: str,
                        catalog: dict, *, migrate: bool = False) -> Tuple[Path, Path]:
-    """Return resolved (json dir, docx dir), optionally migrating legacy output."""
+    """Return resolved (json dir, docx dir), optionally migrating older output."""
     new_json, new_docx = book_paths(json_dir, docx_dir, source, slug, catalog)
     legacy_json = json_dir / slug
     legacy_docx = docx_dir / slug
     if not uses_arabic_layout(catalog, source):
         return legacy_json, legacy_docx
 
-    existing = find_local_book_dir(json_dir, source, slug, catalog)
-    if migrate and existing == legacy_json and legacy_json.exists() and not new_json.exists():
-        try:
-            new_json.parent.mkdir(parents=True, exist_ok=True)
-            legacy_json.rename(new_json)
-            print(f"[move] {slug}: {legacy_json} -> {new_json}")
-            existing = new_json
-        except OSError as exc:
-            print(f"[warn] {slug}: cannot move {legacy_json}: {exc}", file=sys.stderr)
-    if migrate and legacy_docx.exists() and not new_docx.exists():
-        try:
-            new_docx.parent.mkdir(parents=True, exist_ok=True)
-            legacy_docx.rename(new_docx)
-            print(f"[move] {slug}: {legacy_docx} -> {new_docx}")
-        except OSError as exc:
-            print(f"[warn] {slug}: cannot move {legacy_docx}: {exc}", file=sys.stderr)
+    existing_json = find_local_book_dir(json_dir, source, slug, catalog)
+    existing_docx = find_local_docx_dir(docx_dir, source, slug, catalog)
 
-    if existing != new_json:
-        return existing, legacy_docx
+    def move(src: Path, dst: Path, kind: str) -> None:
+        if not migrate or src == dst or not src.exists() or dst.exists():
+            return
+        try:
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            src.rename(dst)
+            print(f"[move] {slug}: {kind} {src} -> {dst}")
+        except OSError as exc:
+            print(f"[warn] {slug}: cannot move {src}: {exc}", file=sys.stderr)
+
+    move(existing_json, new_json, "json")
+    move(existing_docx, new_docx, "docx")
     return new_json, new_docx
 
 
 def discover_local_slugs(json_dir: Path, source: str) -> List[str]:
-    """Find slugs with local surah JSON, including new Arabic layout."""
+    """Find slugs with local surah JSON, including nested Arabic layouts."""
     slugs = set()
     source_root = json_dir / SOURCE_PATHS[source]
     if source_root.exists():
-        for meta_path in sorted(source_root.glob("*/*/meta.json")):
+        for meta_path in sorted(source_root.rglob("meta.json")):
             data = json_read(meta_path)
             if data and data.get("slug"):
                 slugs.add(str(data["slug"]))
         if not slugs:
-            for path in sorted(source_root.glob("*/*/sura*.json")):
-                match = re.match(r"sura(\d{3})\.json$", path.name)
-                if match:
-                    slugs.add(path.parent.name)
+            for path in sorted(source_root.rglob("sura*.json")):
+                data = json_read(path.parent / "meta.json")
+                if data and data.get("slug"):
+                    slugs.add(str(data["slug"]))
     if json_dir.exists():
         for path in json_dir.iterdir():
             if (not path.is_dir() or path.name in SOURCE_PATHS.values()
@@ -541,6 +709,8 @@ def write_book_meta(path: Path, tafsir_meta: dict, catalog_entry: dict,
         "author": clean_label(catalog_entry.get("author") or tafsir_meta.get("author") or ""),
         "category": catalog_entry.get("category") or tafsir_meta.get("category") or {},
         "categories": catalog_entry.get("categories") or tafsir_meta.get("categories") or [],
+        "facets": catalog_entry.get("facets") or tafsir_meta.get("facets") or {},
+        "path_categories": catalog_entry.get("path_categories") or [],
         "catalog_entry": catalog_entry,
         "source": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
         "source_index": f"{BASE}/{SOURCE_PATHS[source]}/{slug}/index.html",
@@ -1773,12 +1943,18 @@ def local_surah_numbers(slug: str, json_dir: Path, *,
 def main(argv: Optional[List[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("--tafsirs", default="tabary",
+    p.add_argument("--tafsirs", default=None,
                    help="comma-separated tafsir/book slugs, or 'all' (default: tabary)")
     p.add_argument("--all", action="store_true",
                    help="select every book in the selected source (alias for --tafsirs all)")
     p.add_argument("--category", dest="categories", action="append", default=[],
-                   help="select tafsirs by Arabic category name, era slug, or tag "
+                   help="select tafsirs by Arabic category name, era/method/coverage "
+                        "slug, or tag (repeatable; tafsirs only)")
+    p.add_argument("--method", dest="methods", action="append", default=[],
+                   help="select by المنهج: athar, ahkam, lugha, tadabbur, muyassar, other "
+                        "(repeatable; tafsirs only)")
+    p.add_argument("--coverage", dest="coverages", action="append", default=[],
+                   help="select by التغطية: full, partial, 1, 0, or Arabic label "
                         "(repeatable; tafsirs only)")
     p.add_argument("--source", choices=sorted(SOURCE_PATHS), default="tafseer",
                    help="book index to use: tafseer (default) or uloom")
@@ -1850,7 +2026,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="include source URL under each ayah in DOCX")
     args = p.parse_args(argv)
 
+    def split_values(values: Iterable[str]) -> List[str]:
+        return [part.strip() for raw in values
+                for part in str(raw).split(",") if part.strip()]
+
     source = args.source
+    methods = split_values(args.methods)
+    coverages = split_values(args.coverages)
+    facet_values = list(args.categories) + methods + coverages
     args.styled = not args.no_styled
     quran_classes = {c.strip() for c in args.quran_classes.split(",") if c.strip()}
     quran_color = hex_to_rgb(args.quran_color)
@@ -1858,8 +2041,6 @@ def main(argv: Optional[List[str]] = None) -> int:
     surah_spec = (args.surahs or "1").strip()
     full_mode = bool(args.full or args.full_alias
                      or surah_spec.lower() in ("all", "*"))
-    if args.all:
-        args.tafsirs = "all"
 
     combine_slugs = [s.strip() for s in (args.combine or "").split(",") if s.strip()]
     if combine_slugs:
@@ -1906,20 +2087,32 @@ def main(argv: Optional[List[str]] = None) -> int:
     elif not build_only:
         surah_meta, names, _short = load_quran_data()
 
-    if args.categories and source != "tafseer":
-        print("[error] --category is currently available for tafsirs only", file=sys.stderr)
+    if facet_values and source != "tafseer":
+        print("[error] --category/--method/--coverage are available for tafsirs only",
+              file=sys.stderr)
         return 2
 
     if not combine_slugs:
-        explicit = [s.strip() for s in (args.tafsirs or "").split(",") if s.strip()]
-        wants_all = args.all or any(v.strip().lower() in ("all", "*") for v in explicit)
-        if args.categories:
+        explicit = split_values([args.tafsirs]) if args.tafsirs else []
+        if not facet_values and not args.all and not explicit:
+            explicit = ["tabary"]
+        wants_all = args.all or any(v.lower() in ("all", "*") for v in explicit)
+        explicit_slugs = [v for v in explicit if v.lower() not in ("all", "*")]
+        if facet_values:
             if not catalog:
                 print(f"[error] no local category catalog at {cat_path}; "
-                      f"scrape once before using --category with --docx", file=sys.stderr)
+                      f"scrape once before using category filters with --docx",
+                      file=sys.stderr)
                 return 1
-            slugs = slugs_from_categories(catalog, args.categories)
-            slugs.extend(s for s in explicit if s not in slugs)
+            selected_sets: List[set] = []
+            if args.categories:
+                selected_sets.append(set(slugs_from_categories(catalog, args.categories)))
+            if methods:
+                selected_sets.append(set(slugs_from_facets(catalog, methods=methods)))
+            if coverages:
+                selected_sets.append(set(slugs_from_facets(catalog, coverages=coverages)))
+            slugs = sorted(set.intersection(*selected_sets)) if selected_sets else []
+            slugs.extend(s for s in explicit_slugs if s not in slugs)
         elif wants_all:
             if build_only:
                 slugs = discover_local_slugs(args.json_dir, source)
@@ -1958,6 +2151,10 @@ def main(argv: Optional[List[str]] = None) -> int:
           f"mode={mode} | scope={'FULL' if full_mode else f'surahs {surahs}'}")
     if args.categories:
         print(f"[category] {', '.join(args.categories)}")
+    if methods:
+        print(f"[method] {', '.join(methods)}")
+    if coverages:
+        print(f"[coverage] {', '.join(coverages)}")
     if combine_slugs:
         print(f"[combine] {' + '.join(combine_slugs)} -> "
               f"{args.docx_dir / 'combined' / combine_label}")
