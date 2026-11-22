@@ -66,6 +66,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from pathlib import Path
+import gzip
 from typing import Dict, Iterable, List, Optional, Tuple
 
 from bs4 import BeautifulSoup, NavigableString
@@ -146,6 +147,14 @@ DEFAULT_CONFIG = {
             "lisan", "qamoos", "tamyeez", "jothur",
         ],
         "word_to_html": {"ٗ": "ࣰ", "ٞ": "ࣱ", "ٖ": "ࣲ"},
+        "data_cache": {
+            "enabled": True,
+            "dir": "data/cache/uloom-qu",
+            "compress": True,
+            "version": "auto",
+            "auto_version": True,
+            "version_probe": "{base}/",
+        },
     },
     "parsing": {
         "block_text_classes": ["bh", "bl", "bx", "ba", "bz", "fb", "fi"],
@@ -257,6 +266,18 @@ def _cfg_color(key: str, fallback: str) -> str:
 def _cfg_str(section: dict, key: str, fallback: str) -> str:
     value = section.get(key, fallback)
     return str(value) if value is not None else str(fallback)
+
+
+def _cfg_bool(section: dict, key: str, fallback: bool) -> bool:
+    value = section.get(key, fallback)
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _config_relative_path(value: str) -> Path:
+    path = Path(value)
+    return path if path.is_absolute() else CONFIG_PATH.parent / path
 
 
 def _cfg_list(section: dict, key: str, fallback: list) -> list:
@@ -419,9 +440,21 @@ ULOOM_WORD_SLUGS = frozenset(_cfg_list(CFG_ULOOM, "word_slugs", [
 ]))
 
 # QU ayah payloads and QR word-entry bodies. These URLs are static enough to
-# configure; the QU files themselves still change with the book text.
+# configure; the QU files themselves change with the book text, so the shared
+# cache is keyed by the site asset version.
 ULOOM_DATA_URL = _url("uloom_data", surah="{surah}", ayah="{ayah}")
 ULOOM_WORD_R_URL = _url("uloom_word_entry", slug="{slug}", key="{key}")
+
+ULOOM_CACHE_CFG = _cfg_map(
+    CFG_ULOOM, "data_cache", DEFAULT_CONFIG["uloom"]["data_cache"])
+ULOOM_CACHE_ENABLED = _cfg_bool(ULOOM_CACHE_CFG, "enabled", True)
+ULOOM_CACHE_DIR = _config_relative_path(
+    _cfg_str(ULOOM_CACHE_CFG, "dir", "data/cache/uloom-qu"))
+ULOOM_CACHE_COMPRESS = _cfg_bool(ULOOM_CACHE_CFG, "compress", True)
+ULOOM_CACHE_VERSION = _cfg_str(ULOOM_CACHE_CFG, "version", "auto")
+ULOOM_CACHE_AUTO_VERSION = _cfg_bool(ULOOM_CACHE_CFG, "auto_version", True)
+ULOOM_CACHE_PROBE_URL = str(
+    ULOOM_CACHE_CFG.get("version_probe") or "{base}/").replace("{base}", BASE)
 
 # The QU word list uses different combining marks for tanween than the HTML
 # ayah element. Translate them so --from-data ayah_text matches HTML mode.
@@ -642,6 +675,150 @@ def json_write(path: Path, data: dict) -> None:
     tmp = path.with_name(path.name + ".tmp")
     tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     tmp.replace(path)
+
+
+# --------------------------------------------------------------------------- #
+# Shared uloom QU payload cache
+# --------------------------------------------------------------------------- #
+# One /uloom/_d/<s>-<a>.js file holds every ayah-based uloom book for that ayah.
+# Save it once per (asset version, surah, ayah) so later books/runs only need to
+# read it locally and extract their own slug. The version directory makes stale
+# copies harmless; --refresh/--force redownload into the current version.
+_ULOOM_CACHE_LOCK = threading.Lock()
+_ULOOM_CACHE_VERSION: Optional[str] = None
+_ULOOM_CACHE_STATS = {"hits": 0, "fetched": 0, "saved": 0}
+
+
+def _safe_cache_version(value: object) -> str:
+    text = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value or "")).strip("-.")
+    return text or "unknown"
+
+
+def reset_uloom_cache_stats() -> None:
+    with _ULOOM_CACHE_LOCK:
+        for key in _ULOOM_CACHE_STATS:
+            _ULOOM_CACHE_STATS[key] = 0
+
+
+def _bump_uloom_cache_stat(name: str) -> None:
+    with _ULOOM_CACHE_LOCK:
+        _ULOOM_CACHE_STATS[name] += 1
+
+
+def report_uloom_cache_stats() -> None:
+    if not ULOOM_CACHE_ENABLED:
+        return
+    with _ULOOM_CACHE_LOCK:
+        stats = dict(_ULOOM_CACHE_STATS)
+        version = _ULOOM_CACHE_VERSION or ULOOM_CACHE_VERSION
+    if not (stats["hits"] or stats["fetched"]):
+        return
+    print(f"[cache] uloom QU payloads ({version}): "
+          f"{stats['hits']} reused, {stats['fetched']} fetched, "
+          f"{stats['saved']} saved -> {ULOOM_CACHE_DIR / version}")
+
+
+def _detect_uloom_cache_version(args) -> str:
+    """Resolve the site asset version used as the cache namespace."""
+    global _ULOOM_CACHE_VERSION
+    if _ULOOM_CACHE_VERSION is not None:
+        return _ULOOM_CACHE_VERSION
+    with _ULOOM_CACHE_LOCK:
+        if _ULOOM_CACHE_VERSION is not None:
+            return _ULOOM_CACHE_VERSION
+        configured = _cfg_str(ULOOM_CACHE_CFG, "version", "auto").strip()
+        if configured and configured.lower() != "auto":
+            resolved = _safe_cache_version(configured)
+        else:
+            resolved = ""
+            if ULOOM_CACHE_AUTO_VERSION and ULOOM_CACHE_PROBE_URL:
+                try:
+                    probe_html = fetch_text(
+                        ULOOM_CACHE_PROBE_URL, retries=1,
+                        timeout=getattr(args, "timeout", 30), delay=0)
+                except Exception as exc:  # noqa: BLE001
+                    print(f"[warn] cannot detect uloom asset version: "
+                          f"{network_error_hint(exc)}; using 'unknown' cache folder",
+                          file=sys.stderr)
+                else:
+                    for asset in ("app.js", "quran-data.js", "style.css"):
+                        match = re.search(
+                            re.escape(asset) + r"\?v=([A-Za-z0-9_.-]+)", probe_html)
+                        if match:
+                            resolved = _safe_cache_version(match.group(1))
+                            break
+            resolved = resolved or "unknown"
+        _ULOOM_CACHE_VERSION = resolved
+        print(f"[cache] uloom QU cache version: {_ULOOM_CACHE_VERSION}")
+        return _ULOOM_CACHE_VERSION
+
+
+def _uloom_payload_cache_paths(surah: int, ayah: int, version: str
+                               ) -> Tuple[Path, Path]:
+    """Return (compressed, plain) cache paths; compressed one is preferred."""
+    base = ULOOM_CACHE_DIR / version / f"{surah}-{ayah}.js"
+    return base.with_name(base.name + ".gz"), base
+
+
+def _read_uloom_payload_cache(surah: int, ayah: int, version: str
+                              ) -> Optional[bytes]:
+    paths = _uloom_payload_cache_paths(surah, ayah, version)
+    for path, compressed in zip(paths, (True, False)):
+        try:
+            raw = path.read_bytes()
+            if compressed:
+                raw = gzip.decompress(raw)
+        except (OSError, EOFError):
+            continue
+        if raw.lstrip().startswith(b"QU("):
+            return raw
+    return None
+
+
+def _write_uloom_payload_cache(surah: int, ayah: int, version: str,
+                               raw: bytes) -> bool:
+    if not raw or not raw.lstrip().startswith(b"QU("):
+        return False
+    compressed_path, plain_path = _uloom_payload_cache_paths(
+        surah, ayah, version)
+    path = compressed_path if ULOOM_CACHE_COMPRESS else plain_path
+    payload = gzip.compress(raw, 6) if ULOOM_CACHE_COMPRESS else raw
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{threading.get_ident()}.tmp")
+        tmp.write_bytes(payload)
+        tmp.replace(path)
+    except OSError as exc:
+        print(f"[warn] cannot save uloom QU cache {path}: {exc}", file=sys.stderr)
+        return False
+    return True
+
+
+def fetch_uloom_payload(surah: int, ayah: int, args) -> bytes:
+    """Fetch or reuse the shared QU payload for one ayah."""
+    data_url = ULOOM_DATA_URL.format(surah=surah, ayah=ayah)
+    fetch_kwargs = {
+        "retries": args.retries,
+        "timeout": args.timeout,
+        "delay": args.delay,
+    }
+    if not ULOOM_CACHE_ENABLED:
+        return fetch_bytes(data_url, **fetch_kwargs)
+
+    version = _detect_uloom_cache_version(args)
+    force_network = bool(getattr(args, "refresh", False)
+                         or getattr(args, "force", False))
+    if not force_network:
+        cached = _read_uloom_payload_cache(surah, ayah, version)
+        if cached is not None:
+            _bump_uloom_cache_stat("hits")
+            return cached
+
+    _bump_uloom_cache_stat("fetched")
+    raw = fetch_bytes(data_url, **fetch_kwargs)
+    if _write_uloom_payload_cache(surah, ayah, version, raw):
+        _bump_uloom_cache_stat("saved")
+    return raw
 
 
 def build_display_names(books: Dict[str, dict]) -> Dict[str, str]:
@@ -2183,11 +2360,9 @@ def fetch_and_parse_ayah(url: str, slug: str, surah: int, ayah: int, args) -> di
 
 def fetch_and_parse_uloom_data(url: str, slug: str, surah: int, ayah: int,
                                args) -> Optional[dict]:
-    """Fetch one structured QU payload instead of its HTML ayah page."""
-    data_url = ULOOM_DATA_URL.format(surah=surah, ayah=ayah)
+    """Load one structured QU payload (cache-first) for an HTML ayah page."""
     t0 = time.perf_counter()
-    raw = fetch_bytes(data_url, retries=args.retries, timeout=args.timeout,
-                      delay=args.delay)
+    raw = fetch_uloom_payload(surah, ayah, args)
     t1 = time.perf_counter()
     item = parse_uloom_data_ayah(raw, slug, surah, ayah, url,
                                  args.include_html, args.styled,
@@ -3669,11 +3844,14 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--timeout", type=int, default=DEFAULT_TIMEOUT)
     p.add_argument("--delay", type=float, default=0.0,
                    help="delay before each request, seconds")
-    p.add_argument("--force", action="store_true", help="re-scrape existing surah JSON")
+    p.add_argument("--force", action="store_true",
+                   help="re-scrape existing surah JSON and bypass the shared "
+                        "uloom QU payload cache")
     p.add_argument("--refresh", action="store_true",
                    help="re-download discovery data (book catalog, surah list, "
-                        "book info, sitemaps) instead of using the saved copies; "
-                        "--force is separate and re-fetches ayah pages")
+                        "book info, sitemaps) and shared uloom QU payloads "
+                        "instead of using saved copies; --force is separate and "
+                        "re-fetches ayah pages")
     p.add_argument("--stats", action="store_true",
                    help="print where scrape time goes (fetch vs parse, retries, "
                         "worker utilisation); useful for tuning --workers")
@@ -3792,6 +3970,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # QU structured data is now the uloom default. --from-html opts back into
     # the original full-page parser; tafsirs always stay on HTML.
     args.from_data = source == "uloom" and not explicit_from_html
+    reset_uloom_cache_stats()
 
     # --docx must not touch the network, so use a local 1..114 range here.
     all_numbers = list(range(1, 115))
@@ -4174,6 +4353,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"[error] {slug}: no surah JSON available for full output",
                           file=sys.stderr)
                     any_error = True
+    report_uloom_cache_stats()
     return 1 if any_error else 0
 
 

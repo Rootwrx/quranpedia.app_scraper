@@ -33,10 +33,15 @@ index. The 78 uloom books split into two groups:
 - **69 ayah-based books** (134,210 ayah pages) use structured QU data by
   default: `https://quranpedia.app/uloom/_d/<s>-<a>.js` instead of full
   `suraN-ayaM.html` pages. This produces the same plain-text/styled-segment
-  JSON and adds `data_url`, `source_page`, and `source_coverage`. The QU files
-  change when book text changes, so they are never cached; the static `۞`
-  marker list is cached in `quran-text.json`. `--from-data` is an explicit
-  alias, and `--from-html` opts back into the original full-page pipeline.
+  JSON and adds `data_url`, `source_page`, and `source_coverage`. One QU file
+  contains every ayah-based book for that ayah, so it is saved once under
+  `data/cache/uloom-qu/<asset-version>/<s>-<a>.js.gz` (gzip by default) and
+  reused by every selected book and later run; each book still extracts only
+  its own slug. The version namespace keeps stale copies out of use,
+  `--refresh`/`--force` redownload into the current version, and old version
+  folders can be deleted freely. The static `۞` marker list is cached in
+  `quran-text.json`. `--from-data` is an explicit alias, and `--from-html`
+  opts back into the original full-page pipeline.
 - **9 word/root dictionaries** (`raghib`, `umdah`, `ishtiqaqi`, `maqayees`,
   `sihah`, `lisan`, `qamoos`, `tamyeez`, `jothur`) are headword books, not ayah
   books. Their sitemaps list `/w/<key>.html` entries. The QU ayah payload only
@@ -257,6 +262,11 @@ sections are:
 - `uloom.word_slugs`: the 9 word/root dictionaries. Add or remove slugs here to
   control which uloom books use the headword `_r` pipeline instead of ayah `_d`
   data.
+- `uloom.data_cache`: shared per-ayah QU payload cache. `enabled` turns it on,
+  `dir` picks the cache root, `compress: true` stores `.js.gz` files (set false
+  for plain `.js`), `version: auto` detects the site asset version (or pins a
+  version string), and `version_probe` is the one URL read for that detection.
+  `--refresh`/`--force` bypass saved payloads.
 - `uloom.word_to_html`: tanween character mapping between QU data and HTML.
 - `urls`: site URL templates, including `_d`, `_r`, sitemap, and index paths.
 - `parsing.block_text_classes` / `parsing.block_tags`: inline block rules.

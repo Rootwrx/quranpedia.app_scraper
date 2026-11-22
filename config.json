@@ -69,6 +69,14 @@
       "ٗ": "ࣰ",
       "ٞ": "ࣱ",
       "ٖ": "ࣲ"
+    },
+    "data_cache": {
+      "enabled": true,
+      "dir": "data/cache/uloom-qu",
+      "compress": true,
+      "version": "auto",
+      "auto_version": true,
+      "version_probe": "{base}/"
     }
   },
   "parsing": {
