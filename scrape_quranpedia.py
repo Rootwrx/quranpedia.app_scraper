@@ -3645,8 +3645,9 @@ def main(argv: Optional[List[str]] = None) -> int:
                    help="output folder/file prefix for --combine "
                         "(default: slugs joined with '-')")
     p.add_argument("--surahs", default=None,
-                   help="per-surah scope: '1', '1-3', '1,2,18', or 'all'/1-114 "
-                        "(default: 1); does not build a combined volume")
+                   help="per-surah scope: '1', '1-3', '1,2,18', or 'all' "
+                        "(available surahs only; default: 1); does not build "
+                        "a combined volume")
     p.add_argument("--docx", action="store_true", dest="build_only",
                    help="build DOCX only from existing JSON; do not scrape or use network")
     p.add_argument("--no-json", action="store_true", dest="build_only",
@@ -3754,6 +3755,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         print("[error] use either --full or --surahs, not both", file=sys.stderr)
         return 2
     full_mode = bool(args.full or args.full_alias)
+    all_surahs_requested = surah_spec.lower() in ("all", "*")
 
     combine_slugs = [s.strip() for s in (args.combine or "").split(",") if s.strip()]
     if combine_slugs:
@@ -3915,8 +3917,10 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     label = "Books" if source == "uloom" else "Tafsirs"
     source_label = "local" if combine_slugs else source
+    scope_label = ("FULL" if full_mode else
+                   "surahs all" if all_surahs_requested else f"surahs {surahs}")
     print(f"{label}: {len(slugs)} | source={source_label} | workers={args.workers} | "
-          f"mode={mode} | scope={'FULL' if full_mode else f'surahs {surahs}'}")
+          f"mode={mode} | scope={scope_label}")
     if args.categories:
         print(f"[category] {', '.join(args.categories)}")
     if methods:
@@ -3928,16 +3932,18 @@ def main(argv: Optional[List[str]] = None) -> int:
               f"{args.docx_dir / 'combined' / combine_label}")
 
     if combine_slugs:
-        if full_mode:
+        if full_mode or all_surahs_requested:
             available = sorted({s for slug in slugs
                                 for s in local_surah_numbers(
                                     slug, args.json_dir,
                                     book_dir=find_local_book_dir(
                                         args.json_dir, source, slug, catalog))})
             surahs = available
-            print(f"[combine] full: {len(surahs)} surahs available across selected tafsirs")
+            kind = "full" if full_mode else "all"
+            print(f"[combine] {kind}: {len(surahs)} surahs available across selected tafsirs")
             if not surahs:
-                print("[error] no surah JSON found for --combine --full", file=sys.stderr)
+                print(f"[error] no surah JSON found for --combine --{kind}",
+                      file=sys.stderr)
                 return 1
         combined_files, combined_errors = build_combined_docx_for_surahs(
             slugs, surahs, args.json_dir, args.docx_dir, combine_label,
@@ -4032,21 +4038,32 @@ def main(argv: Optional[List[str]] = None) -> int:
                     print(f"[error] {slug}: could not build "
                           f"{full_docx_name(slug, catalog, source)}", file=sys.stderr)
                     any_error = True
-            else:
-                built = build_docx_for_surahs(
-                    slug, surahs, json_root, args.docx_dir,
-                    args.tafsir_font, args.font_size, args.include_source,
-                    quran_font=args.quran_font, quran_classes=quran_classes,
-                    bold=args.bold_tafsir, line_spacing=args.line_spacing,
-                    page_color=args.page_color, quran_color=quran_color,
-                    t1_color=t1_color, book_json_dir=json_book,
-                    book_docx_dir=docx_book,
-                )
-                if len(built) != len(surahs):
-                    print(f"[error] {slug}: built {len(built)}/{len(surahs)} "
-                          f"per-surah DOCX files (missing JSON or locked output)",
+                continue
+
+            # --surahs all means every surah this book actually has locally,
+            # not a literal 1..114. This keeps partial books error-free.
+            selected = available if all_surahs_requested else surahs
+            if all_surahs_requested:
+                print(f"[all] {slug}: {len(selected)} surah JSON files available")
+                if not selected:
+                    print(f"[error] {slug}: no surah JSON found in {json_book}",
                           file=sys.stderr)
                     any_error = True
+                    continue
+            built = build_docx_for_surahs(
+                slug, selected, json_root, args.docx_dir,
+                args.tafsir_font, args.font_size, args.include_source,
+                quran_font=args.quran_font, quran_classes=quran_classes,
+                bold=args.bold_tafsir, line_spacing=args.line_spacing,
+                page_color=args.page_color, quran_color=quran_color,
+                t1_color=t1_color, book_json_dir=json_book,
+                book_docx_dir=docx_book,
+            )
+            if len(built) != len(selected):
+                print(f"[error] {slug}: built {len(built)}/{len(selected)} "
+                      f"per-surah DOCX files (missing JSON or locked output)",
+                      file=sys.stderr)
+                any_error = True
             continue
 
         old_cache = load_fetch_cache(json_book)
@@ -4127,9 +4144,12 @@ def main(argv: Optional[List[str]] = None) -> int:
             except OSError:
                 pass
             save_fetch_cache(json_book, fetch_cache)
-        surahs_for_slug = sorted({s for (s, _a) in urls}) if full_mode else surahs
-        if full_mode:
-            print(f"[full] {slug}: {len(surahs_for_slug)} surahs available in sitemap")
+        if full_mode or all_surahs_requested:
+            surahs_for_slug = sorted({s for (s, _a) in urls})
+            kind = "full" if full_mode else "all"
+            print(f"[{kind}] {slug}: {len(surahs_for_slug)} surahs available in sitemap")
+        else:
+            surahs_for_slug = surahs
 
         try:
             write_book_meta(json_book / "meta.json", tafsir_meta, catalog_entry,

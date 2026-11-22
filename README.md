@@ -287,8 +287,12 @@ All three operations choose one output shape:
   - combine mode: the union of surahs available across the selected tafsirs,
     plus `<label>-full.docx`
 
-`--surahs all` means all individual surahs; it does not create a combined
-volume. Use `--full` for that. Supplying both prints
+`--surahs all` means **all surahs available for each selected book**: sitemap
+surahs when scraping, local surah JSON files when building DOCX, and the union
+of local surahs in combine mode. It is safe for partial books with fewer than
+114 surahs. An explicit range such as `--surahs 1-114` stays literal and will
+report missing surahs. `--surahs all` never creates a combined volume; use
+`--full` for that. Supplying both prints
 `[error] use either --full or --surahs, not both`.
 
 Scrape details:
