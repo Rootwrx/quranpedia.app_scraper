@@ -277,14 +277,19 @@ if no saved catalog exists. Raising `--workers` above 12 rarely helps because
 the site throttles requests; lower it
 if you see rate-limit errors.
 
-All three operations support the same two scopes:
+All three operations choose one output shape:
 
-- per surah via `--surahs 1`, `--surahs 1-3`, etc.
-- full via `--full` (or `--surahs all`):
+- per-surah via `--surahs 1`, `--surahs 1-3`, `--surahs 1-114`, or
+  `--surahs all` — these all produce separate surah outputs
+- full via `--full` — cannot be combined with `--surahs`:
   - scrape mode: every surah in that tafsir's sitemap, plus `full.json`
   - DOCX mode: only `<Arabic tafsir name>-full.docx` (no per-surah DOCX)
   - combine mode: the union of surahs available across the selected tafsirs,
     plus `<label>-full.docx`
+
+`--surahs all` means all individual surahs; it does not create a combined
+volume. Use `--full` for that. Supplying both prints
+`[error] use either --full or --surahs, not both`.
 
 Scrape details:
 
@@ -480,7 +485,8 @@ carry `/uloom/...` source URLs and correct uloom book metadata. A local
 ## Decisions confirmed so far
 
 - Modes: default = scrape only; `--docx` = build DOCX only, no network. ✅
-- Both modes support per-surah (`--surahs`) and full (`--full`) scopes. ✅
+- Scope is explicit: `--surahs` selects per-surah outputs (including `all`);
+  `--full` selects the combined output; they cannot be combined. ✅
 - JSON: `meta.json` first, then per-surah files; `--full` additionally writes
   `full.json`. Tafsirs use nested Arabic era/method/coverage folders; uloom uses
   nested Arabic field/coverage folders. Legacy slug folders are migrated. ✅

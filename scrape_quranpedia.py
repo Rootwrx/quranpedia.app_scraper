@@ -19,6 +19,9 @@ Usage examples
   python scrape_quranpedia.py --book tabary --full
   python scrape_quranpedia.py --book tabary --full --docx
 
+  # all per-surah DOCX files; --surahs all does not build a combined volume
+  python scrape_quranpedia.py --book tabary --docx --surahs all
+
   # select tafsirs by nested category: era / method / coverage
   python scrape_quranpedia.py --category المتقدمون --surahs 1
   python scrape_quranpedia.py --category era-2 --method athar --coverage full --full
@@ -3641,8 +3644,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     p.add_argument("--combine-name",
                    help="output folder/file prefix for --combine "
                         "(default: slugs joined with '-')")
-    p.add_argument("--surahs", default="1",
-                   help="'all', '1-3', '1,2,18' (default: 1)")
+    p.add_argument("--surahs", default=None,
+                   help="per-surah scope: '1', '1-3', '1,2,18', or 'all'/1-114 "
+                        "(default: 1); does not build a combined volume")
     p.add_argument("--docx", action="store_true", dest="build_only",
                    help="build DOCX only from existing JSON; do not scrape or use network")
     p.add_argument("--no-json", action="store_true", dest="build_only",
@@ -3746,8 +3750,10 @@ def main(argv: Optional[List[str]] = None) -> int:
     quran_color = hex_to_rgb(args.quran_color)
     t1_color = hex_to_rgb(args.t1_color)
     surah_spec = (args.surahs or "1").strip()
-    full_mode = bool(args.full or args.full_alias
-                     or surah_spec.lower() in ("all", "*"))
+    if (args.full or args.full_alias) and args.surahs is not None:
+        print("[error] use either --full or --surahs, not both", file=sys.stderr)
+        return 2
+    full_mode = bool(args.full or args.full_alias)
 
     combine_slugs = [s.strip() for s in (args.combine or "").split(",") if s.strip()]
     if combine_slugs:
